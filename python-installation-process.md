@@ -45,6 +45,18 @@ GDBM_LIBS="-L$(brew --prefix gdbm)/lib -lgdbm" \
   --enable-optimizations
 ```
 
+```bash
+PREFIX="$HOME/opt/python/3.14.3"
+
+GDBM_CFLAGS="-I$(brew --prefix gdbm)/include" \
+GDBM_LIBS="-L$(brew --prefix gdbm)/lib -lgdbm" \
+./configure \
+  --prefix="$PREFIX" \
+  --enable-optimizations
+```
+
+
+
 * `--enable-optimizations --with-lto` are the officially recommended flags for a PGO + LTO build ([Python Developer's Guide][3]).
 * The GDBM and OpenSSL environment variables follow the Homebrew snippet for Python 3.13+ in the devguide ([Python Developer's Guide][1]).
 * Leaving out `--enable-framework` yields a classic Unix tree in `bin/ lib/ include/`.
