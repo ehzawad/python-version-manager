@@ -39,6 +39,14 @@ _fetch() {
     curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$url"
 }
 
+# Text fetch for metadata pages. Some python.org endpoints (including the
+# Sigstore metadata page) serve gzip-compressed HTML regardless of the
+# client's Accept-Encoding; --compressed asks curl to decompress.
+_fetch_text() {
+    local url="$1" out="$2"
+    curl --compressed -fsSL --retry 3 --retry-delay 2 -o "$out" "$url"
+}
+
 _file_mtime() {
     # Seconds since epoch, macOS stat -f + Linux stat -c fallback.
     stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
@@ -151,56 +159,236 @@ _local_installs() {
 
 # === Verification ===
 
+# Embedded fallback in case the metadata page is unreachable and no cache exists.
+# From https://www.python.org/downloads/metadata/sigstore/ — last synced 2026-04-17.
+# Three distinct OIDC issuers in active use:
+#   accounts.google.com          — Pablo Galindo, Thomas Wouters (3.10-3.13)
+#   github.com/login/oauth       — interactive OAuth for Hugo, Savannah, Nad, Łukasz
+#   token.actions.githubusercontent.com — GitHub Actions CI (not currently used)
+_sigstore_embedded_fallback() {
+    cat <<'FALLBACK'
+3.7	nad@python.org	https://github.com/login/oauth
+3.8	lukasz@langa.pl	https://github.com/login/oauth
+3.9	lukasz@langa.pl	https://github.com/login/oauth
+3.10	pablogsal@python.org	https://accounts.google.com
+3.11	pablogsal@python.org	https://accounts.google.com
+3.12	thomas@python.org	https://accounts.google.com
+3.13	thomas@python.org	https://accounts.google.com
+3.14	hugo@python.org	https://github.com/login/oauth
+3.15	hugo@python.org	https://github.com/login/oauth
+3.16	savannah@python.org	https://github.com/login/oauth
+3.17	savannah@python.org	https://github.com/login/oauth
+FALLBACK
+}
+
+_sigstore_metadata_path() {
+    print -- "$_PYINSTALL_CACHE/sigstore-metadata.tsv"
+}
+
+# Fetch + parse the python.org Sigstore metadata page. Atomic replace of the
+# cache only on successful parse with ≥1 valid row.
+_refresh_sigstore_metadata() {
+    _mkcache
+    local cache
+    cache=$(_sigstore_metadata_path)
+    local tmp_html="${cache}.html.$$"
+    local tmp_tsv="${cache}.tmp.$$"
+
+    if ! _fetch_text "https://www.python.org/downloads/metadata/sigstore/" "$tmp_html"; then
+        rm -f "$tmp_html" "$tmp_tsv" 2>/dev/null
+        return 1
+    fi
+
+    local py
+    py=$(_bootstrap_python) || { rm -f "$tmp_html" "$tmp_tsv" 2>/dev/null; return 1; }
+
+    # Parse the first <table> whose first data row has 4+ cells matching
+    # (release, pep, manager, issuer). Emit tab-separated rows of
+    # "<release>\t<identity-email>\t<issuer-url>". Skip rows with blank PEP.
+    "$py" - "$tmp_html" > "$tmp_tsv" <<'PY'
+import re, sys
+from html.parser import HTMLParser
+
+class TableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_table = self.in_tr = self.in_cell = False
+        self.cell = []
+        self.row = []
+        self.rows = []
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self.in_table = True
+        elif self.in_table and tag == "tr":
+            self.in_tr = True
+            self.row = []
+        elif self.in_tr and tag in ("td", "th"):
+            self.in_cell = True
+            self.cell = []
+    def handle_data(self, data):
+        if self.in_cell:
+            self.cell.append(data)
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.in_cell:
+            text = " ".join("".join(self.cell).split())
+            self.row.append(text)
+            self.in_cell = False
+        elif tag == "tr" and self.in_tr:
+            if self.row:
+                self.rows.append(self.row)
+            self.in_tr = False
+        elif tag == "table":
+            self.in_table = False
+
+doc = open(sys.argv[1], encoding="utf-8").read()
+p = TableParser()
+p.feed(doc)
+
+release_re = re.compile(r"^\d+\.\d+$")
+email_re = re.compile(r"[\w.+-]+@[\w.-]+")
+url_re = re.compile(r"https://\S+")
+
+for row in p.rows:
+    if len(row) < 4:
+        continue
+    release = row[0].strip()
+    manager = row[2]
+    issuer = row[3]
+    if not release_re.fullmatch(release):
+        continue
+    email = email_re.search(manager)
+    url = url_re.search(issuer)
+    if email and url:
+        print(f"{release}\t{email.group(0)}\t{url.group(0)}")
+PY
+
+    # Validate: need at least one row with the expected 3-column shape.
+    if ! awk -F'\t' 'NF==3 && $1 ~ /^[0-9]+\.[0-9]+$/ { ok=1 } END { exit !ok }' "$tmp_tsv"; then
+        rm -f "$tmp_html" "$tmp_tsv" 2>/dev/null
+        return 1
+    fi
+
+    mv "$tmp_tsv" "$cache"
+    rm -f "$tmp_html" 2>/dev/null
+    return 0
+}
+
+# Resolve the Sigstore identity+issuer for a minor series (e.g. "3.14").
+# Prints "<identity>\t<issuer>" on success; returns 1 if minor not found.
+# Policy: fresh cache > refresh > stale cache (warn) > embedded fallback (warn) > fail.
+_sigstore_identity_for() {
+    local minor="$1"
+    local cache
+    cache=$(_sigstore_metadata_path)
+    local age=999999
+    [[ -f "$cache" ]] && age=$(( $(date +%s) - $(_file_mtime "$cache") ))
+
+    if [[ ! -f "$cache" ]] || (( age > 86400 )); then
+        if _refresh_sigstore_metadata 2>/dev/null; then
+            :  # fresh cache, good
+        elif [[ -f "$cache" ]]; then
+            _warn "Could not refresh Sigstore metadata; using stale cache (${age}s old)"
+        else
+            _sigstore_embedded_fallback > "$cache" 2>/dev/null || return 1
+            _warn "Sigstore metadata fetch failed; using embedded fallback (2026-04-17 snapshot)"
+        fi
+    fi
+
+    local line
+    line=$(awk -F'\t' -v m="$minor" '$1 == m { print; exit }' "$cache")
+    [[ -n "$line" ]] || return 1
+    local release identity issuer
+    IFS=$'\t' read -r release identity issuer <<< "$line"
+    print -- "${identity}\t${issuer}"
+}
+
+# Ensure the Sigstore helper venv is available with a sigstore CLI >= 3.3 and
+# a supporting Python >= 3.10. Idempotent.
+_ensure_sigstore_venv() {
+    if [[ -x "${_PYINSTALL_SIGSTORE_VENV}/bin/python" ]]; then
+        # Quick sanity check: CLI responds to `verify identity --help`
+        if "$_PYINSTALL_SIGSTORE_VENV/bin/python" -m sigstore verify identity --help \
+                >/dev/null 2>&1; then
+            return 0
+        fi
+        _warn "Existing sigstore venv doesn't respond to 'verify identity'; recreating"
+        rm -rf "$_PYINSTALL_SIGSTORE_VENV"
+    fi
+
+    # Sigstore 3.3+ requires Python >= 3.10.
+    local cand py=""
+    for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10 /usr/bin/python3; do
+        if command -v "$cand" >/dev/null 2>&1 && \
+           "$cand" -c 'import sys; assert sys.version_info >= (3, 10)' 2>/dev/null; then
+            py=$(command -v "$cand")
+            break
+        fi
+    done
+    [[ -n "$py" ]] || { _warn "No Python >= 3.10 available to bootstrap the Sigstore venv"; return 1; }
+
+    _log "Creating Sigstore helper venv at $_PYINSTALL_SIGSTORE_VENV (Python $($py -V | awk '{print $2}')) ..."
+    PIP_REQUIRE_VIRTUALENV=0 "$py" -m venv "$_PYINSTALL_SIGSTORE_VENV" \
+        || { _warn "venv creation failed"; return 1; }
+    "$_PYINSTALL_SIGSTORE_VENV/bin/pip" install --quiet --upgrade pip \
+        || { _warn "pip upgrade failed"; return 1; }
+    "$_PYINSTALL_SIGSTORE_VENV/bin/pip" install --quiet 'sigstore>=3.3,<5' \
+        || { _warn "sigstore install failed"; return 1; }
+    "$_PYINSTALL_SIGSTORE_VENV/bin/python" -m sigstore verify identity --help \
+        >/dev/null 2>&1 \
+        || { _warn "sigstore CLI 'verify identity' not found after install"; return 1; }
+    return 0
+}
+
 _verify_sigstore() {
-    # Strong verification for Python 3.14+.
+    # Strong verification for Python 3.14+. Optional override_identity/override_issuer
+    # let the caller supply cert claims for a series not yet in the metadata table.
     local version="$1" tarball="$2"
+    local override_identity="${3:-}" override_issuer="${4:-}"
+    local mm="${version%.*}"
     local base="https://www.python.org/ftp/python/${version}"
     local bundle="${tarball}.sigstore"
+
     _log "Fetching Sigstore bundle ..."
     _fetch "${base}/${tarball:t}.sigstore" "$bundle" || {
         _warn "No Sigstore bundle available at $base"
         return 1
     }
 
-    # Establish the sigstore CLI in a private venv (created once, cached).
-    if [[ ! -x "${_PYINSTALL_SIGSTORE_VENV}/bin/python" ]]; then
-        local py
-        py=$(_bootstrap_python) || { _warn "No bootstrap Python for sigstore"; return 1; }
-        _log "Creating Sigstore helper venv at $_PYINSTALL_SIGSTORE_VENV ..."
-        # PIP_REQUIRE_VIRTUALENV is set by the manager baseline; explicitly
-        # unset it for the bootstrap pip call since we're creating the venv.
-        PIP_REQUIRE_VIRTUALENV=0 "$py" -m venv "$_PYINSTALL_SIGSTORE_VENV" \
-            || { _warn "venv creation failed"; return 1; }
-        "$_PYINSTALL_SIGSTORE_VENV/bin/pip" install --quiet --upgrade pip sigstore \
-            || { _warn "sigstore install failed"; return 1; }
+    _ensure_sigstore_venv || return 1
+
+    local identity issuer
+    if [[ -n "$override_identity" ]] && [[ -n "$override_issuer" ]]; then
+        identity="$override_identity"
+        issuer="$override_issuer"
+        _log "Using caller-supplied identity/issuer overrides"
+    else
+        local line
+        line=$(_sigstore_identity_for "$mm") || {
+            _err "No Sigstore identity mapping for Python ${mm}"
+            _err "Update the embedded fallback, or pass --sigstore-identity and --sigstore-issuer."
+            return 1
+        }
+        IFS=$'\t' read -r identity issuer <<< "$line"
     fi
 
-    # Expected identity varies per release manager. Current mapping per
-    # https://www.python.org/downloads/metadata/sigstore/ (as of 2026):
-    #   3.13: thomas@python.org
-    #   3.14, 3.15: hugo@python.org
-    local mm="${version%.*}"
-    local major="${version%%.*}"
-    local minor="${mm#*.}"
-    local identity
-    case "$mm" in
-        3.13)       identity="thomas@python.org" ;;
-        3.14|3.15)  identity="hugo@python.org" ;;
-        *)
-            _warn "Unknown Sigstore identity for $mm; check python.org/downloads/metadata/sigstore/"
-            return 1 ;;
-    esac
+    _log "Verifying Sigstore signature:"
+    _log "  identity: $identity"
+    _log "  issuer:   $issuer"
 
-    _log "Verifying Sigstore signature (identity=$identity) ..."
-    "$_PYINSTALL_SIGSTORE_VENV/bin/python" -m sigstore verify identity \
-        --bundle "$bundle" \
-        --cert-identity "$identity" \
-        --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
-        "$tarball" >&2 && {
-            _log "Sigstore verification OK"
-            return 0
-        }
-    _err "Sigstore verification failed"
+    if "$_PYINSTALL_SIGSTORE_VENV/bin/python" -m sigstore verify identity \
+            --bundle "$bundle" \
+            --cert-identity "$identity" \
+            --cert-oidc-issuer "$issuer" \
+            "$tarball" >&2; then
+        _log "Sigstore verification OK"
+        return 0
+    fi
+
+    _err "Sigstore verification failed for ${tarball:t}"
+    _err "Expected from metadata: identity=${identity}, issuer=${issuer}"
+    _err "If python.org's metadata has been updated since the embedded fallback"
+    _err "was recorded, run: rm $(_sigstore_metadata_path) to force a re-fetch."
+    _err "Or supply explicit --sigstore-identity and --sigstore-issuer to match the bundle."
     return 1
 }
 
@@ -242,19 +430,21 @@ _verify_gpg() {
 }
 
 _verify_tarball() {
-    # Choose the right verification path by version. Respects --no-sigstore
-    # to force the GPG or sha256 path.
-    local version="$1" tarball="$2" no_sigstore="$3"
+    # Choose the right verification path by version. --allow-tls-only
+    # (alias: --no-sigstore) forces TLS-only. --sigstore-identity and
+    # --sigstore-issuer together override the metadata lookup.
+    local version="$1" tarball="$2" allow_tls_only="$3"
+    local override_identity="${4:-}" override_issuer="${5:-}"
     local mm="${version%.*}"
     local minor="${mm#*.}"
 
     if (( minor >= 14 )); then
-        if (( no_sigstore )); then
-            _warn "Skipping Sigstore by request; no alternative signature exists for $version — relying on TLS only"
+        if (( allow_tls_only )); then
+            _warn "Skipping Sigstore by request (--allow-tls-only); relying on TLS integrity only for $version"
             return 0
         fi
-        _verify_sigstore "$version" "$tarball" && return 0
-        _die "Sigstore verification failed for $version; pass --no-sigstore to bypass at your own risk"
+        _verify_sigstore "$version" "$tarball" "$override_identity" "$override_issuer" && return 0
+        _die "Sigstore verification failed for $version; pass --allow-tls-only to bypass at your own risk"
     else
         _verify_gpg "$version" "$tarball" && return 0
         _warn "GPG verification failed or unavailable; proceeding with TLS-only integrity"
@@ -533,9 +723,10 @@ typeset -g _PYINSTALL_UPGRADE_MINOR=""
 
 # Render the full pre-flight install plan to stderr. Reads the args the caller
 # already parsed so the display cannot drift from the actual invocation.
-#   _render_install_plan <version> <prefix> <jobs> <no_sigstore> <force> <keep_build>
+#   _render_install_plan <version> <prefix> <jobs> <allow_tls_only> <force> <keep_build> [<sigstore_identity> <sigstore_issuer>]
 _render_install_plan() {
-    local version="$1" prefix="$2" jobs="$3" no_sigstore="$4" force="$5" keep_build="$6"
+    local version="$1" prefix="$2" jobs="$3" allow_tls_only="$4" force="$5" keep_build="$6"
+    local override_identity="${7:-}" override_issuer="${8:-}"
     local mm="${version%.*}"
     local minor="${mm#*.}"
     local base="https://www.python.org/ftp/python/${version}"
@@ -568,22 +759,34 @@ _render_install_plan() {
     # --- Verification ---
     print -u2 -- "Verification"
     if (( minor >= 14 )); then
-        if (( no_sigstore )); then
-            print -u2 -- "  Method:       TLS-only (Sigstore disabled by --no-sigstore)"
+        if (( allow_tls_only )); then
+            print -u2 -- "  Method:       TLS-only (Sigstore disabled by --allow-tls-only)"
             print -u2 -- "  Identity:     n/a"
         else
             print -u2 -- "  Method:       Sigstore bundle (Python 3.14+)"
-            local identity
-            case "$mm" in
-                3.14|3.15) identity="hugo@python.org" ;;
-                *)         identity="unknown — check python.org/downloads/metadata/sigstore/" ;;
-            esac
+            local identity issuer source
+            if [[ -n "$override_identity" ]] && [[ -n "$override_issuer" ]]; then
+                identity="$override_identity"
+                issuer="$override_issuer"
+                source="--sigstore-identity / --sigstore-issuer"
+            else
+                local line
+                if line=$(_sigstore_identity_for "$mm" 2>/dev/null); then
+                    IFS=$'\t' read -r identity issuer <<< "$line"
+                    source="python.org metadata (cached)"
+                else
+                    identity="UNKNOWN"
+                    issuer="UNKNOWN"
+                    source="NOT FOUND — pass --sigstore-identity and --sigstore-issuer"
+                fi
+            fi
             print -u2 -- "  Identity:     $identity"
-            print -u2 -- "  Issuer:       https://token.actions.githubusercontent.com"
+            print -u2 -- "  Issuer:       $issuer"
+            print -u2 -- "  Source:       $source"
             if [[ -x "${_PYINSTALL_SIGSTORE_VENV}/bin/python" ]]; then
                 print -u2 -- "  Helper venv:  $_PYINSTALL_SIGSTORE_VENV (exists)"
             else
-                print -u2 -- "  Helper venv:  $_PYINSTALL_SIGSTORE_VENV (will be created; installs sigstore from PyPI)"
+                print -u2 -- "  Helper venv:  $_PYINSTALL_SIGSTORE_VENV (will be created; installs sigstore>=3.3,<5 from PyPI)"
             fi
         fi
     else
@@ -701,18 +904,21 @@ _move_prefix_aside() {
 
 _cmd_install() {
     local version="" jobs="" prefix=""
-    local no_sigstore=0 keep_build=0 assume_yes=0 dry_run=0 force=0
+    local allow_tls_only=0 keep_build=0 assume_yes=0 dry_run=0 force=0
+    local sigstore_identity="" sigstore_issuer=""
     while (( $# )); do
         case "$1" in
-            -y|--yes)        assume_yes=1; shift ;;
-            -j|--jobs)       jobs="$2"; shift 2 ;;
-            --no-sigstore)   no_sigstore=1; shift ;;
-            --keep-build)    keep_build=1; shift ;;
-            --prefix)        prefix="$2"; shift 2 ;;
-            --dry-run)       dry_run=1; shift ;;
-            --force)         force=1; shift ;;
-            -h|--help)       _cmd_help; return 0 ;;
-            -*)              _die "unknown flag: $1" ;;
+            -y|--yes)              assume_yes=1; shift ;;
+            -j|--jobs)             jobs="$2"; shift 2 ;;
+            --allow-tls-only|--no-sigstore) allow_tls_only=1; shift ;;
+            --sigstore-identity)   sigstore_identity="$2"; shift 2 ;;
+            --sigstore-issuer)     sigstore_issuer="$2"; shift 2 ;;
+            --keep-build)          keep_build=1; shift ;;
+            --prefix)              prefix="$2"; shift 2 ;;
+            --dry-run)             dry_run=1; shift ;;
+            --force)               force=1; shift ;;
+            -h|--help)             _cmd_help; return 0 ;;
+            -*)                    _die "unknown flag: $1" ;;
             *)
                 if [[ -z "$version" ]]; then
                     version="$1"
@@ -723,6 +929,11 @@ _cmd_install() {
                 ;;
         esac
     done
+
+    if [[ -n "$sigstore_identity" && -z "$sigstore_issuer" ]] || \
+       [[ -z "$sigstore_identity" && -n "$sigstore_issuer" ]]; then
+        _die "--sigstore-identity and --sigstore-issuer must be passed together"
+    fi
 
     [[ -n "$version" ]] || _die "usage: pyinstall install <X.Y.Z> [flags]"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || _die "invalid version: $version"
@@ -741,7 +952,7 @@ _cmd_install() {
     # the plan tells the user what's missing.
     _check_deps || true
 
-    _render_install_plan "$version" "$prefix" "$jobs" "$no_sigstore" "$force" "$keep_build"
+    _render_install_plan "$version" "$prefix" "$jobs" "$allow_tls_only" "$force" "$keep_build" "$sigstore_identity" "$sigstore_issuer"
 
     if (( dry_run )); then
         # Exit nonzero if the install would fail at preconditions; otherwise 0.
@@ -790,7 +1001,7 @@ _cmd_install() {
                     # Re-check deps (cheap) and re-render the plan with the new prefix so
                     # Existing/Binary lines reflect the change.
                     _check_deps || true
-                    _render_install_plan "$version" "$prefix" "$jobs" "$no_sigstore" "$force" "$keep_build"
+                    _render_install_plan "$version" "$prefix" "$jobs" "$allow_tls_only" "$force" "$keep_build" "$sigstore_identity" "$sigstore_issuer"
                     # After editing, the clobber check needs to re-run against the new prefix.
                     if _install_would_clobber "$prefix" "$version" "$force"; then
                         print -u2 -- "(use --force to rebuild, or [e]dit a different prefix)"
@@ -824,7 +1035,7 @@ _cmd_install() {
         _log "Using cached download: $tarball"
     fi
 
-    _verify_tarball "$version" "$tarball" "$no_sigstore"
+    _verify_tarball "$version" "$tarball" "$allow_tls_only" "$sigstore_identity" "$sigstore_issuer"
 
     local builddir="$_PYINSTALL_BUILD_DIR/Python-$version"
     rm -rf "$builddir"
@@ -910,13 +1121,16 @@ Subcommands:
   help                   This help
 
 Install/upgrade flags:
-  -y, --yes              Skip confirmation prompt
-  -j, --jobs N           make -j N (default: detected)
-  --dry-run              Print the install plan and exit without building
-  --force                If the prefix already exists, move it aside and rebuild
-  --no-sigstore          Skip Sigstore verification (3.14+ falls back to TLS-only)
-  --keep-build           Keep build tree after successful install
-  --prefix DIR           Override install prefix (default: ~/opt/python/<version>)
+  -y, --yes                     Skip confirmation prompt
+  -j, --jobs N                  make -j N (default: detected)
+  --dry-run                     Print the install plan and exit without building
+  --force                       If the prefix already exists, move it aside and rebuild
+  --allow-tls-only              Skip Sigstore/GPG (3.14+ relies on TLS only) — use with caution
+  --no-sigstore                 Alias for --allow-tls-only
+  --sigstore-identity EMAIL     Override the expected cert-identity (for new series not in metadata)
+  --sigstore-issuer URL         Override the expected cert-oidc-issuer (pass with --sigstore-identity)
+  --keep-build                  Keep build tree after successful install
+  --prefix DIR                  Override install prefix (default: ~/opt/python/<version>)
 
 Source of truth:
   - Supported minor series: https://peps.python.org/api/python-releases.json
