@@ -34,6 +34,17 @@
 typeset -ga _PYTHON_VERSIONS
 typeset -gA _PYTHON_PATHS
 typeset -gA _PYTHON_INFO
+# Per-version priority and patch, used by the scanner to pick the best candidate
+# when the same major.minor lives in several locations.
+typeset -gA _PYTHON_PRIORITY
+typeset -gA _PYTHON_PATCH
+# Every python binary found during the scan, tab-joined:
+#   "<version>\t<priority>\t<patch>\t<path>\t<full-version-string>"
+# Consumed by `pyinfo --all` to show shadowed candidates.
+typeset -ga _PYTHON_ALL_CANDIDATES
+# Location of this sourced file + its dir. Used by pyinstall() to find pyinstall.sh.
+typeset -g _PYMANAGER_SCRIPT="${${(%):-%N}:A}"
+typeset -g _PYMANAGER_DIR="${_PYMANAGER_SCRIPT:h}"
 # Caches — safe to clear on re-source.
 typeset -g _VENV_PYTHON_VERSION_CACHE=""
 typeset -g _LAST_VIRTUAL_ENV=""
@@ -148,14 +159,47 @@ typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
   fi
 }
 
+# Candidate priority: higher wins when the same major.minor lives in several
+# places. User-built CPythons beat package-manager installs so that a deliberate
+# `make altinstall` under ~/opt/python is not silently shadowed by Homebrew
+# installing Python as a dependency of some other formula.
+_pymanager_candidate_priority() {
+    local py="$1"
+    local dir="${py:h}"
+    # Patterns are matched left-to-right; more specific patterns appear first.
+    case "$dir" in
+        "$HOME/.local/bin")
+            print 100 ;;
+        "$HOME/opt/python/"*"/bin"|"$HOME/opt/python"*"/bin")
+            print 90 ;;
+        "/opt/python/"*"/bin"|"/opt/python"*"/bin")
+            print 80 ;;
+        "$HOME/.pythons/"*"/bin")
+            print 70 ;;
+        "/opt/homebrew/bin"|"/opt/homebrew/opt/python@"*"/bin")
+            print 50 ;;
+        "/usr/local/bin"|"/usr/local/opt/python@"*"/bin")
+            print 50 ;;
+        "$HOME/bin"|"$HOME/Library/Python/"*"/bin")
+            print 40 ;;
+        "/usr/bin")
+            print 10 ;;
+        *)
+            print 40 ;;
+    esac
+}
+
 # Comprehensive Python scanner - lazy loaded
 _scan_all_pythons() {
     # Skip if already scanned
     [[ $_PYTHONS_SCANNED -eq 1 ]] && return 0
-    
+
     _PYTHON_VERSIONS=()
     _PYTHON_PATHS=()
     _PYTHON_INFO=()
+    _PYTHON_PRIORITY=()
+    _PYTHON_PATCH=()
+    _PYTHON_ALL_CANDIDATES=()
     
     # All possible Python locations on macOS
     local search_paths=(
@@ -263,47 +307,41 @@ _scan_all_pythons() {
             done
         fi
         
-        # Determine if we should store this Python
+        # Compute priority + patch for this candidate.
+        local new_priority=$(_pymanager_candidate_priority "$py")
+        local new_patch=0
+        if [[ "$fullver" =~ 'Python [0-9]+\.[0-9]+\.([0-9]+)' ]]; then
+            new_patch="${match[1]}"
+        fi
+
+        # Remember every candidate (even the losers) for `pyinfo --all`.
+        _PYTHON_ALL_CANDIDATES+=("${version}	${new_priority}	${new_patch}	${py}	${fullver}")
+
+        # Replacement policy:
+        #   - first candidate for this major.minor always wins
+        #   - otherwise higher priority wins (user-built > Homebrew > system)
+        #   - within the same priority, higher patch version wins
         local should_store=0
-        
         if [[ -z "${_PYTHON_PATHS[$version]}" ]]; then
-            # First time seeing this major.minor version
             should_store=1
         else
-            # Already have this version, decide which to keep
-            
-            # Preference 1: Always prefer $HOME/.local/bin
-            if [[ "${py%/*}" == "$HOME/.local/bin" ]]; then
+            local stored_priority="${_PYTHON_PRIORITY[$version]:-0}"
+            local stored_patch="${_PYTHON_PATCH[$version]:-0}"
+            if (( new_priority > stored_priority )); then
                 should_store=1
-            # Preference 2: Compare patch versions - keep the highest
-            elif [[ "$fullver" =~ 'Python ([0-9]+)\.([0-9]+)\.([0-9]+)' ]]; then
-                local new_major="${match[1]}"
-                local new_minor="${match[2]}"
-                local new_patch="${match[3]}"
-                
-                # Extract stored version
-                local stored_info="${_PYTHON_INFO[$version]}"
-                if [[ "$stored_info" =~ 'Python ([0-9]+)\.([0-9]+)\.([0-9]+)' ]]; then
-                    local stored_major="${match[1]}"
-                    local stored_minor="${match[2]}"
-                    local stored_patch="${match[3]}"
-                    
-                    # Compare patch versions numerically
-                    if (( new_patch > stored_patch )); then
-                        should_store=1
-                    fi
-                fi
+            elif (( new_priority == stored_priority )) && (( new_patch > stored_patch )); then
+                should_store=1
             fi
         fi
-        
-        # Store this Python if we decided to
-        if [[ $should_store -eq 1 ]]; then
-            # Only add to array if this is the first time we see this major.minor
+
+        if (( should_store )); then
             if [[ -z "${_PYTHON_PATHS[$version]}" ]]; then
                 _PYTHON_VERSIONS+=("$version")
             fi
             _PYTHON_PATHS[$version]="$py"
             _PYTHON_INFO[$version]="$fullver ($realpath)"
+            _PYTHON_PRIORITY[$version]="$new_priority"
+            _PYTHON_PATCH[$version]="$new_patch"
         fi
     done
     
@@ -1641,12 +1679,89 @@ pydiag() {
     echo "   3. The script should auto-detect sandboxing and bypass safely"
 }
 
+# Locate pyinstall.sh. Tries $PYMANAGER_ROOT first, then the directory this
+# file lives in, then a couple of well-known install locations.
+_pymanager_find_pyinstall() {
+    local -a candidates=()
+    [[ -n "${PYMANAGER_ROOT:-}" ]] && candidates+=("$PYMANAGER_ROOT/pyinstall.sh")
+    [[ -n "$_PYMANAGER_DIR" ]]    && candidates+=("$_PYMANAGER_DIR/pyinstall.sh")
+    candidates+=(
+        "$HOME/.config/zsh/pyinstall.sh"
+        "$HOME/.local/share/pymanager/pyinstall.sh"
+    )
+    local c
+    for c in $candidates; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
+        [[ -f "$c" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+# Dispatch to pyinstall.sh, then refresh the scanner so the current shell picks
+# up any newly installed interpreter without reloading.
+pyinstall() {
+    local script
+    if ! script=$(_pymanager_find_pyinstall); then
+        echo "Error: pyinstall.sh not found." >&2
+        echo "  Set PYMANAGER_ROOT to the directory containing pyinstall.sh," >&2
+        echo "  or place pyinstall.sh next to pythonmanager.sh." >&2
+        return 1
+    fi
+    if [[ ! -x "$script" ]]; then
+        zsh "$script" "$@"
+    else
+        "$script" "$@"
+    fi
+    local rc=$?
+    # install/upgrade may have added a new interpreter — invalidate the cache so
+    # the next python3.X / pyinfo / setpy call sees it without a shell reload.
+    if (( rc == 0 )); then
+        case "${1:-}" in
+            install|upgrade) _PYTHONS_SCANNED=0 ;;
+        esac
+    fi
+    return $rc
+}
+
+# Force a rescan of Python installations. Useful after installing a new
+# CPython build (via pyinstall or manually) so the current shell sees it
+# without having to reload.
+pyrefresh() {
+    _PYTHONS_SCANNED=0
+    _VENV_PYTHON_VERSION_CACHE=""
+    _LAST_VIRTUAL_ENV=""
+    _scan_all_pythons
+    if (( ${#_PYTHON_VERSIONS} == 0 )); then
+        echo "No Python 3.x installations found."
+        return 1
+    fi
+    echo "Rescanned ${#_PYTHON_VERSIONS} Python version(s):"
+    local ver
+    for ver in $_PYTHON_VERSIONS; do
+        echo "  ${ver} -> ${_PYTHON_PATHS[$ver]}"
+    done
+}
+
 # Enhanced pyinfo function
 pyinfo() {
     if ! _py_manager_available; then
         echo "Warning: Python manager helpers unavailable; pyinfo cannot run"
         return 1
     fi
+
+    local show_all=0
+    while (( $# )); do
+        case "$1" in
+            --all|-a) show_all=1; shift ;;
+            -h|--help)
+                echo "Usage: pyinfo [--all]"
+                echo "  (default)  Show one Python per major.minor — the highest-priority candidate."
+                echo "  --all      Also show shadowed candidates (Homebrew etc.) for each minor."
+                return 0
+                ;;
+            *) echo "pyinfo: unknown flag: $1" >&2; return 2 ;;
+        esac
+    done
 
     echo "Python Environment Status:"
     echo ""
@@ -1703,11 +1818,14 @@ pyinfo() {
     fi
     
     _scan_all_pythons
-    
+
     if (( ${#_PYTHON_VERSIONS} == 0 )); then
         echo "No Python 3.x found on system"
     else
         echo "System Python Versions:"
+        local cand cand_ver cand_pri cand_patch cand_path cand_full
+        local L p fv mark pri selected
+        local -a lines
         for ver in $_PYTHON_VERSIONS; do
             echo ""
             echo "  Python $ver:"
@@ -1716,6 +1834,26 @@ pyinfo() {
             echo "    Usage: python${ver} -m venv <venv-name>"
             if [[ "$ver" == "$_PYTHON_OVERRIDE" ]]; then
                 echo "    Status: * Currently set as override"
+            fi
+            if (( show_all )); then
+                lines=()
+                for cand in $_PYTHON_ALL_CANDIDATES; do
+                    IFS=$'\t' read -r cand_ver cand_pri cand_patch cand_path cand_full <<< "$cand"
+                    [[ "$cand_ver" == "$ver" ]] || continue
+                    lines+=("${cand_pri}	${cand_patch}	${cand_path}	${cand_full}")
+                done
+                if (( ${#lines} > 1 )); then
+                    echo "    Candidates (priority desc, patch desc; * = selected):"
+                    selected="${_PYTHON_PATHS[$ver]}"
+                    for L in ${(On)lines}; do
+                        pri="${L%%	*}"
+                        p="${L#*	*	}"; p="${p%%	*}"
+                        fv="${L##*	}"
+                        mark=" "
+                        [[ "$p" == "$selected" ]] && mark="*"
+                        echo "      ${mark} [pri=${pri}] ${p}  (${fv})"
+                    done
+                fi
             fi
         done
         echo ""

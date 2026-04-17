@@ -18,8 +18,10 @@ A lightweight shell-based Python version manager that enforces explicit Python v
 # Create config directory
 mkdir -p ~/.config/zsh ~/.local/bin
 
-# Copy the script
-cp pythonmanager.sh ~/.config/zsh/
+# Copy both scripts side by side; pyinstall.sh is auto-discovered by
+# pythonmanager.sh via the pyinstall() shell function.
+cp pythonmanager.sh pyinstall.sh ~/.config/zsh/
+chmod +x ~/.config/zsh/pyinstall.sh
 
 # Add to ~/.zshrc (create if doesn't exist)
 echo '# Python Version Manager
@@ -91,10 +93,35 @@ deactivate
 
 ```bash
 pyinfo                  # Show all Python versions and current status
+pyinfo --all            # Also show shadowed candidates (e.g. Homebrew's 3.14.4 under your self-built 3.14.3)
 pywhich python3.X       # Show actual binary path for a version
 which python3.X         # Enhanced which (uses pywhich for python/pip)
 pydiag                  # Debug diagnostics (for troubleshooting)
+pyrefresh               # Force-rescan Python installations (after manual install)
 ```
+
+### Managing CPython source builds (pyinstall)
+
+The `pyinstall` helper compares what you have under `~/opt/python/<version>/` against the
+current patch releases on python.org, and automates the source-build recipe in
+[python-installation-process.md](./python-installation-process.md).
+
+```bash
+pyinstall status                 # Diff installed vs upstream-latest per supported minor
+pyinstall latest                 # Print upstream-latest patch for every supported minor
+pyinstall latest 3.14            # Just one minor
+pyinstall deps                   # Print the OS-specific dep install command (does not run it)
+pyinstall install 3.14.4         # Download, verify, build, altinstall
+pyinstall upgrade 3.14           # Shortcut: install latest patch for the 3.14 series
+pyinstall verify <tarball>       # Dry-run verification on an already-downloaded tarball
+```
+
+Verification paths:
+
+- **Python 3.14+** — Sigstore (bundle at `Python-X.Y.Z.tgz.sigstore`); the `sigstore` package is installed into a dedicated cached venv at `~/.cache/pymanager/sigstore-venv/` so it never pollutes your system interpreter.
+- **Python 3.13 and older** — OpenPGP (`.asc` signature) against release-manager keys from `keys.openpgp.org`.
+
+`pyinstall install` calls `pyrefresh` on success so the new interpreter is visible to the current shell immediately.
 
 ## Command Reference
 
@@ -106,9 +133,14 @@ pydiag                  # Debug diagnostics (for troubleshooting)
 | `setpy <version> --build` | Set default + allow pip |
 | `setpy clear` | Clear override and build mode |
 | `setpy` | Show current status |
-| `pyinfo` | Show all Python versions |
+| `pyinfo` | Show selected Python per major.minor |
+| `pyinfo --all` | Also show shadowed candidates |
+| `pyrefresh` | Re-scan for newly installed Pythons |
 | `pywhich <cmd>` | Show what binary would run |
 | `pydiag` | Debug diagnostics |
+| `pyinstall status` | Diff installed self-builds vs upstream latest |
+| `pyinstall install <X.Y.Z>` | Source-build and install a new CPython |
+| `pyinstall upgrade <X.Y>` | Install latest patch of a series |
 
 ## How It Works
 
@@ -175,6 +207,29 @@ The script auto-detects Python installations in:
 - `/usr/bin` (System Python)
 - `~/opt/python/*/bin` (Custom builds)
 - `/opt/python/*/bin`
+
+### Scanner preference order
+
+When the same `major.minor` version lives in multiple locations (e.g. your
+self-built `~/opt/python/3.14.3/bin/python3.14` **and** a Homebrew-installed
+`/opt/homebrew/bin/python3.14` pulled in as a dependency), the scanner picks the
+one with the highest priority:
+
+| Priority | Location |
+|----------|----------|
+| 100 | `~/.local/bin` |
+| 90 | `~/opt/python/<version>/bin` (user self-build) |
+| 80 | `/opt/python/<version>/bin` (admin self-build) |
+| 70 | `~/.pythons/*/bin` |
+| 50 | `/opt/homebrew/...`, `/usr/local/opt/python@*/bin` (package manager) |
+| 40 | `~/bin`, `~/Library/Python/*/bin`, other |
+| 10 | `/usr/bin` (system) |
+
+Within the same priority level, the higher patch version wins as a tiebreaker.
+This means a deliberate `make altinstall` under `~/opt/python/` will **not** be
+silently shadowed when Homebrew installs Python 3.14 as a formula dependency,
+even if Homebrew's patch is newer. Use `pyinstall status` to see when your
+self-build is behind upstream, and `pyinfo --all` to see all candidates.
 
 ## Environment Variables
 

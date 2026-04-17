@@ -28,9 +28,45 @@ PYVER=3.14.3   # set this once; used by every step below
 
 cd ~/Downloads
 curl -O "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tgz"
+```
+
+Then verify. Python 3.14 and newer are signed **only with Sigstore**; `.asc` (OpenPGP) signatures are not published. Python 3.13.x and older still publish both. Pick the path for your version:
+
+#### Python 3.14.x and newer — Sigstore
+
+```bash
+curl -O "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tgz.sigstore"
+
+# The `sigstore` CLI is a Python package. Install it into a dedicated venv so
+# it never pollutes a system interpreter. Any already-working Python 3.x will
+# do as the bootstrap (Homebrew, system, or a previous self-build).
+BOOTSTRAP_PY=$(command -v python3 || command -v python3.13 || command -v python3.12)
+"$BOOTSTRAP_PY" -m venv ~/.cache/sigstore-venv
+~/.cache/sigstore-venv/bin/pip install --quiet sigstore
+
+# Expected signer identity for the 3.14/3.15 series is hugo@python.org via
+# GitHub's OIDC issuer. The current mapping is published at
+# https://www.python.org/downloads/metadata/sigstore/ — confirm before trusting.
+~/.cache/sigstore-venv/bin/python -m sigstore verify identity \
+  --bundle "Python-${PYVER}.tgz.sigstore" \
+  --cert-identity "hugo@python.org" \
+  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "Python-${PYVER}.tgz"
+```
+
+#### Python 3.13.x and older — OpenPGP (legacy)
+
+```bash
 curl -O "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tgz.asc"
-gpg --keyserver keys.openpgp.org --recv-keys 64E628F8D68469693D3F93B29109B3CF   # Ned Deily’s release key
+# Release-manager key fingerprint for 3.13.x is Thomas Wouters'; see
+# https://www.python.org/downloads/metadata/pgp/ for the current mapping.
+gpg --keyserver keys.openpgp.org --recv-keys A035C8C19219BA821ECEA86B64E628F8D68469693D3F93B29109B3CF
 gpg --verify "Python-${PYVER}.tgz.asc" "Python-${PYVER}.tgz"
+```
+
+#### Then extract
+
+```bash
 tar -xzf "Python-${PYVER}.tgz"
 cd "Python-${PYVER}"
 ```
