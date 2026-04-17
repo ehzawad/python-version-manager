@@ -647,6 +647,7 @@ _render_install_plan() {
     else
         print -u2 -- "  Existing:     not present"
     fi
+    print -u2 -- "  Change path:  pass --prefix <DIR>, or enter 'e' at the confirmation prompt"
     print -u2 -- ""
 
     # --- Post-build checks ---
@@ -767,10 +768,44 @@ _cmd_install() {
     fi
 
     if (( ! assume_yes )); then
-        print -n -u2 -- "Proceed? [y/N] "
-        local ans
-        read -r ans
-        [[ "$ans" == y* || "$ans" == Y* ]] || _die "aborted"
+        local ans new_prefix
+        while true; do
+            print -n -u2 -- "Proceed? [y]es / [N]o / [e]dit install prefix: "
+            read -r ans
+            case "${ans:l}" in
+                y|yes)
+                    break
+                    ;;
+                ""|n|no)
+                    _die "aborted"
+                    ;;
+                e|edit)
+                    print -n -u2 -- "New install prefix [${prefix}]: "
+                    read -r new_prefix
+                    if [[ -n "$new_prefix" ]]; then
+                        # Expand ~ manually since `read` doesn't tilde-expand.
+                        new_prefix="${new_prefix/#\~/$HOME}"
+                        prefix="$new_prefix"
+                    fi
+                    # Re-check deps (cheap) and re-render the plan with the new prefix so
+                    # Existing/Binary lines reflect the change.
+                    _check_deps || true
+                    _render_install_plan "$version" "$prefix" "$jobs" "$no_sigstore" "$force" "$keep_build"
+                    # After editing, the clobber check needs to re-run against the new prefix.
+                    if _install_would_clobber "$prefix" "$version" "$force"; then
+                        print -u2 -- "(use --force to rebuild, or [e]dit a different prefix)"
+                    fi
+                    ;;
+                *)
+                    print -u2 -- "Please answer y, N, or e."
+                    ;;
+            esac
+        done
+    fi
+
+    # Post-edit re-check for clobber (the user may have edited into an existing prefix).
+    if _install_would_clobber "$prefix" "$version" "$force"; then
+        return 1
     fi
 
     if (( force )); then
