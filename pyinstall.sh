@@ -284,66 +284,144 @@ sudo apt-get install -y \\
 EOF
 }
 
-_check_deps_macos() {
-    command -v brew >/dev/null 2>&1 || {
-        _err "Homebrew not found. Install from https://brew.sh first."
-        return 1
-    }
-    local missing=()
-    local f
-    for f in openssl@3 xz gdbm tcl-tk mpdecimal zstd; do
-        brew --prefix "$f" >/dev/null 2>&1 || missing+=("$f")
-    done
-    if (( ${#missing} )); then
-        _err "Missing Homebrew formulae: ${missing[*]}"
-        return 1
+# Emit one line per dep: "<name>\t<ok|missing>\t<details>". The "details"
+# column is informational (brew prefix, package hint, etc.) and may be empty.
+_deps_status_macos() {
+    if command -v brew >/dev/null 2>&1; then
+        print -- "brew\tok\t$(command -v brew)"
+    else
+        print -- "brew\tmissing\tinstall from https://brew.sh"
+        # Without brew, formula checks can't run; report them all as missing.
+        local f
+        for f in pkg-config openssl@3 xz gdbm tcl-tk mpdecimal zstd; do
+            print -- "$f\tmissing\t(brew unavailable)"
+        done
+        return 0
     fi
+    local f prefix
+    for f in pkg-config openssl@3 xz gdbm tcl-tk mpdecimal zstd; do
+        if prefix=$(brew --prefix "$f" 2>/dev/null); then
+            print -- "$f\tok\t$prefix"
+        else
+            print -- "$f\tmissing\t"
+        fi
+    done
 }
 
-_check_deps_linux() {
-    # Cheap heuristic: check for headers we know we need.
-    local missing=()
-    [[ -f /usr/include/openssl/ssl.h ]] || missing+=("libssl-dev")
-    [[ -f /usr/include/bzlib.h ]] || missing+=("libbz2-dev")
-    [[ -f /usr/include/sqlite3.h ]] || missing+=("libsqlite3-dev")
-    [[ -f /usr/include/ffi.h ]] || [[ -f /usr/include/x86_64-linux-gnu/ffi.h ]] || [[ -f /usr/include/aarch64-linux-gnu/ffi.h ]] || missing+=("libffi-dev")
-    if (( ${#missing} )); then
-        _err "Likely missing apt packages: ${missing[*]}"
-        return 1
-    fi
+_deps_status_linux() {
+    # Header check for system libs; pkg names are the apt hint column.
+    local name header pkg
+    for row in \
+        "openssl:/usr/include/openssl/ssl.h:libssl-dev" \
+        "bz2:/usr/include/bzlib.h:libbz2-dev" \
+        "sqlite3:/usr/include/sqlite3.h:libsqlite3-dev" \
+        "lzma:/usr/include/lzma.h:liblzma-dev" \
+        "readline:/usr/include/readline/readline.h:libreadline-dev" \
+        "gdbm:/usr/include/gdbm.h:libgdbm-dev" \
+        "zlib:/usr/include/zlib.h:zlib1g-dev" \
+        "uuid:/usr/include/uuid/uuid.h:uuid-dev" \
+        "tcl-tk:/usr/include/tk.h:tk-dev"; do
+        name="${row%%:*}"
+        pkg="${row##*:}"
+        header="${row#*:}"; header="${header%:*}"
+        if [[ -f "$header" ]]; then
+            print -- "$name\tok\t$header"
+        else
+            print -- "$name\tmissing\t$pkg"
+        fi
+    done
+    # ffi header lives under arch-specific paths on Debian/Ubuntu.
+    local ffi
+    for ffi in /usr/include/ffi.h /usr/include/*/ffi.h(N); do
+        [[ -f "$ffi" ]] && { print -- "ffi\tok\t$ffi"; return 0; }
+    done
+    print -- "ffi\tmissing\tlibffi-dev"
+}
+
+_deps_status() {
+    case "$_PYINSTALL_OS" in
+        macos) _deps_status_macos ;;
+        linux) _deps_status_linux ;;
+        *)     _warn "Unknown OS — skipping dep status"; return 0 ;;
+    esac
 }
 
 _check_deps() {
-    case "$_PYINSTALL_OS" in
-        macos) _check_deps_macos ;;
-        linux) _check_deps_linux ;;
-        *)     _warn "Unknown OS — skipping dep check"; return 0 ;;
-    esac
+    # Returns 0 if all deps are ok, 1 otherwise. Populates globals
+    # _PYINSTALL_DEPS_OK and _PYINSTALL_DEPS_MISSING (arrays) so the plan
+    # renderer can show per-item status without re-running checks.
+    _PYINSTALL_DEPS_OK=()
+    _PYINSTALL_DEPS_MISSING=()
+    local name state details
+    while IFS=$'\t' read -r name state details; do
+        [[ -n "$name" ]] || continue
+        if [[ "$state" == "ok" ]]; then
+            _PYINSTALL_DEPS_OK+=("$name")
+        else
+            _PYINSTALL_DEPS_MISSING+=("$name")
+        fi
+    done < <(_deps_status)
+    (( ${#_PYINSTALL_DEPS_MISSING} == 0 ))
 }
+typeset -ga _PYINSTALL_DEPS_OK _PYINSTALL_DEPS_MISSING
 
 # === Configure / Build / Post-checks ===
 
-_run_configure() {
+# Print the exact ./configure flags that will be used, one per line. Policy
+# lives here and is the single source of truth for both the plan renderer and
+# the actual invocation.
+_plan_configure_args() {
     local prefix="$1"
-    local -a args=(--prefix="$prefix" --enable-optimizations --with-lto)
+    print -- "--prefix=$prefix"
+    print -- "--enable-optimizations"
+    print -- "--with-lto"
     case "$_PYINSTALL_OS" in
         macos)
             local openssl_prefix
-            openssl_prefix="$(brew --prefix openssl@3 2>/dev/null)" \
-                || _die "brew --prefix openssl@3 failed"
-            args+=(--with-openssl="$openssl_prefix")
-            GDBM_CFLAGS="-I$(brew --prefix gdbm)/include" \
-            GDBM_LIBS="-L$(brew --prefix gdbm)/lib -lgdbm" \
-                ./configure "${args[@]}" >&2
-            ;;
-        linux)
-            ./configure "${args[@]}" >&2
-            ;;
-        *)
-            ./configure "${args[@]}" >&2
+            openssl_prefix=$(brew --prefix openssl@3 2>/dev/null) \
+                || openssl_prefix='<brew --prefix openssl@3 failed>'
+            print -- "--with-openssl=$openssl_prefix"
             ;;
     esac
 }
+
+# Print the environment variables set during ./configure, one KEY=VALUE per
+# line. `env` applies them only to the configure call.
+_plan_configure_env() {
+    case "$_PYINSTALL_OS" in
+        macos)
+            local gdbm_prefix
+            gdbm_prefix=$(brew --prefix gdbm 2>/dev/null) \
+                || gdbm_prefix='<brew --prefix gdbm failed>'
+            print -- "GDBM_CFLAGS=-I${gdbm_prefix}/include"
+            print -- "GDBM_LIBS=-L${gdbm_prefix}/lib -lgdbm"
+            ;;
+    esac
+}
+
+_run_configure() {
+    local prefix="$1"
+    local -a args=() envs=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && args+=("$line")
+    done < <(_plan_configure_args "$prefix")
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && envs+=("$line")
+    done < <(_plan_configure_env)
+
+    if (( ${#envs} )); then
+        env "${envs[@]}" ./configure "${args[@]}" >&2
+    else
+        ./configure "${args[@]}" >&2
+    fi
+}
+
+# Module lists used by _post_install_checks and _render_install_plan.
+# Required: install fails if any of these can't be imported.
+# Optional: install warns but still succeeds.
+_PYINSTALL_REQUIRED_MODULES=(ssl hashlib sqlite3 bz2 lzma ctypes _decimal zlib)
+_PYINSTALL_OPTIONAL_MODULES=(readline _gdbm uuid tkinter)
 
 _post_install_checks() {
     local version="$1" prefix="$2"
@@ -356,26 +434,33 @@ _post_install_checks() {
     _log "$got"
     [[ "$got" == "Python ${version}" ]] || _warn "Version string differs: got '$got', expected 'Python ${version}'"
 
-    _log "Module availability:"
-    local mod ok=() missing=()
-    for mod in ssl sqlite3 bz2 lzma ctypes readline _gdbm uuid _decimal zlib hashlib; do
+    local mod
+    local -a req_ok=() req_missing=() opt_ok=() opt_missing=()
+    for mod in $_PYINSTALL_REQUIRED_MODULES; do
         if "$py" -c "import $mod" 2>/dev/null; then
-            ok+=("$mod")
+            req_ok+=("$mod")
         else
-            missing+=("$mod")
+            req_missing+=("$mod")
         fi
     done
-    _log "  OK: ${ok[*]}"
-    if (( ${#missing} )); then
-        _warn "  MISSING: ${missing[*]} — likely missing system deps"
-    fi
+    for mod in $_PYINSTALL_OPTIONAL_MODULES; do
+        if "$py" -c "import $mod" 2>/dev/null; then
+            opt_ok+=("$mod")
+        else
+            opt_missing+=("$mod")
+        fi
+    done
 
-    # tkinter is most likely to silently fail on macOS if tcl-tk isn't linked.
-    if "$py" -c "import tkinter" 2>/dev/null; then
-        _log "  tkinter: OK"
-    else
-        _warn "  tkinter: FAILED — check tcl-tk installation"
+    _log "Required modules OK: ${req_ok[*]}"
+    (( ${#opt_ok} ))      && _log "Optional modules OK: ${opt_ok[*]}"
+    (( ${#opt_missing} )) && _warn "Optional modules missing: ${opt_missing[*]}"
+
+    if (( ${#req_missing} )); then
+        _err "Required modules missing: ${req_missing[*]}"
+        _err "Install is incomplete. Check system deps (pyinstall deps) and rebuild with --force."
+        return 1
     fi
+    return 0
 }
 
 # === Subcommands ===
@@ -440,8 +525,182 @@ _cmd_verify() {
     _verify_tarball "$version" "$tarball" 0
 }
 
+# Globals set by _cmd_upgrade so _render_install_plan can show upgrade context.
+# Private; reset at the top of _cmd_install.
+typeset -g _PYINSTALL_ACTION=""
+typeset -g _PYINSTALL_UPGRADE_FROM=""
+typeset -g _PYINSTALL_UPGRADE_MINOR=""
+
+# Render the full pre-flight install plan to stderr. Reads the args the caller
+# already parsed so the display cannot drift from the actual invocation.
+#   _render_install_plan <version> <prefix> <jobs> <no_sigstore> <force> <keep_build>
+_render_install_plan() {
+    local version="$1" prefix="$2" jobs="$3" no_sigstore="$4" force="$5" keep_build="$6"
+    local mm="${version%.*}"
+    local minor="${mm#*.}"
+    local base="https://www.python.org/ftp/python/${version}"
+    local tarball_name="Python-${version}.tgz"
+    local tarball="$_PYINSTALL_DOWNLOADS/$tarball_name"
+    local builddir="$_PYINSTALL_BUILD_DIR/Python-$version"
+
+    print -u2 -- ""
+    if [[ "$_PYINSTALL_ACTION" == "upgrade" ]] && [[ -n "$_PYINSTALL_UPGRADE_FROM" ]]; then
+        print -u2 -- "Install plan: CPython ${version}"
+        print -u2 -- "Action: upgrade ${_PYINSTALL_UPGRADE_MINOR} from ${_PYINSTALL_UPGRADE_FROM} to ${version}"
+    else
+        print -u2 -- "Install plan: CPython ${version}"
+        print -u2 -- "Action: fresh install of ${mm} series"
+    fi
+    print -u2 -- "Platform: $_PYINSTALL_OS $(uname -m)"
+    print -u2 -- ""
+
+    # --- Source ---
+    print -u2 -- "Source"
+    print -u2 -- "  URL:          ${base}/${tarball_name}"
+    print -u2 -- "  Cache:        ${tarball}"
+    if [[ -f "$tarball" ]]; then
+        print -u2 -- "  Cache state:  cached ($(_file_mtime "$tarball" | xargs -I{} date -r {} '+%Y-%m-%d %H:%M' 2>/dev/null || echo downloaded))"
+    else
+        print -u2 -- "  Cache state:  not downloaded"
+    fi
+    print -u2 -- ""
+
+    # --- Verification ---
+    print -u2 -- "Verification"
+    if (( minor >= 14 )); then
+        if (( no_sigstore )); then
+            print -u2 -- "  Method:       TLS-only (Sigstore disabled by --no-sigstore)"
+            print -u2 -- "  Identity:     n/a"
+        else
+            print -u2 -- "  Method:       Sigstore bundle (Python 3.14+)"
+            local identity
+            case "$mm" in
+                3.14|3.15) identity="hugo@python.org" ;;
+                *)         identity="unknown — check python.org/downloads/metadata/sigstore/" ;;
+            esac
+            print -u2 -- "  Identity:     $identity"
+            print -u2 -- "  Issuer:       https://token.actions.githubusercontent.com"
+            if [[ -x "${_PYINSTALL_SIGSTORE_VENV}/bin/python" ]]; then
+                print -u2 -- "  Helper venv:  $_PYINSTALL_SIGSTORE_VENV (exists)"
+            else
+                print -u2 -- "  Helper venv:  $_PYINSTALL_SIGSTORE_VENV (will be created; installs sigstore from PyPI)"
+            fi
+        fi
+    else
+        if command -v gpg >/dev/null 2>&1; then
+            print -u2 -- "  Method:       OpenPGP (.asc) via gpg"
+            print -u2 -- "  Keyserver:    keys.openpgp.org"
+        else
+            print -u2 -- "  Method:       TLS-only (gpg not installed)"
+        fi
+    fi
+    print -u2 -- ""
+
+    # --- Dependencies ---
+    print -u2 -- "Dependencies"
+    if (( ${#_PYINSTALL_DEPS_OK} )); then
+        print -u2 -- "  ok:           ${_PYINSTALL_DEPS_OK[*]}"
+    fi
+    if (( ${#_PYINSTALL_DEPS_MISSING} )); then
+        print -u2 -- "  MISSING:      ${_PYINSTALL_DEPS_MISSING[*]}"
+        print -u2 -- "  Install:      pyinstall deps  (prints the command for your OS)"
+    else
+        print -u2 -- "  missing:      none"
+    fi
+    print -u2 -- ""
+
+    # --- Build ---
+    print -u2 -- "Build"
+    print -u2 -- "  Work dir:     ${builddir}"
+    print -u2 -- "  Work cleanup: removed before extract; $(if (( keep_build )); then print -n 'kept after success'; else print -n 'removed after success'; fi); kept on failure"
+    local envline
+    local env_shown=0
+    while IFS= read -r envline; do
+        [[ -n "$envline" ]] || continue
+        if (( ! env_shown )); then
+            print -u2 -- "  Configure env:"
+            env_shown=1
+        fi
+        print -u2 -- "    $envline"
+    done < <(_plan_configure_env)
+    print -u2 -- "  Configure:"
+    local argline
+    local -a cfg_args=()
+    while IFS= read -r argline; do
+        [[ -n "$argline" ]] && cfg_args+=("$argline")
+    done < <(_plan_configure_args "$prefix")
+    print -u2 -- "    ./configure ${cfg_args[*]}"
+    print -u2 -- "  Make:         make -j${jobs} && make altinstall"
+    print -u2 -- ""
+
+    # --- Install ---
+    print -u2 -- "Install"
+    print -u2 -- "  Prefix:       ${prefix}"
+    print -u2 -- "  Binary:       ${prefix}/bin/python${mm}"
+    if [[ -x "${prefix}/bin/python${mm}" ]]; then
+        if (( force )); then
+            local backup="${prefix}.old-$(date +%Y%m%d-%H%M%S)"
+            print -u2 -- "  Existing:     present; --force will move aside to ${backup}"
+        else
+            print -u2 -- "  Existing:     PRESENT — install will refuse without --force"
+        fi
+    else
+        print -u2 -- "  Existing:     not present"
+    fi
+    print -u2 -- ""
+
+    # --- Post-build checks ---
+    print -u2 -- "Post-build checks"
+    print -u2 -- "  Required:     ${_PYINSTALL_REQUIRED_MODULES[*]}  (install fails on any miss)"
+    print -u2 -- "  Optional:     ${_PYINSTALL_OPTIONAL_MODULES[*]}  (warnings only)"
+    print -u2 -- ""
+
+    # --- Shell refresh ---
+    print -u2 -- "Shell refresh"
+    print -u2 -- "  When run via the pyinstall() shell function, pyrefresh is called on success."
+    print -u2 -- "  When run as the script directly, run 'pyrefresh' in your interactive shell."
+    print -u2 -- ""
+}
+
+# True if _cmd_install should refuse because the prefix is already installed
+# and --force wasn't given. Prints guidance to stderr.
+_install_would_clobber() {
+    local prefix="$1" version="$2" force="$3"
+    local mm="${version%.*}"
+    [[ -x "$prefix/bin/python${mm}" ]] || return 1  # nothing to clobber
+    if (( force )); then
+        return 1  # --force explicitly opts in
+    fi
+    _err "CPython ${version} already exists at ${prefix}"
+    _err "Pass --force to rebuild (the existing prefix will be moved aside, not overwritten)."
+    return 0
+}
+
+# Move an existing prefix aside before a --force rebuild. Only auto-renames
+# prefixes under the managed root ($_PYINSTALL_PREFIX_ROOT); refuses to touch
+# arbitrary prefixes without operator confirmation.
+_move_prefix_aside() {
+    local prefix="$1"
+    [[ -d "$prefix" ]] || return 0
+    local stamp backup
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="${prefix}.old-${stamp}"
+
+    if [[ "${prefix:A}" == "${_PYINSTALL_PREFIX_ROOT:A}"/* ]]; then
+        _log "Moving existing prefix aside: $prefix -> $backup"
+        mv "$prefix" "$backup"
+        return 0
+    fi
+
+    # Prefix is outside the managed root — require explicit confirmation.
+    _err "Refusing to move aside prefix outside ~/opt/python: $prefix"
+    _err "Move or remove it manually, then re-run install."
+    return 1
+}
+
 _cmd_install() {
-    local version="" jobs="" prefix="" no_sigstore=0 keep_build=0 assume_yes=0
+    local version="" jobs="" prefix=""
+    local no_sigstore=0 keep_build=0 assume_yes=0 dry_run=0 force=0
     while (( $# )); do
         case "$1" in
             -y|--yes)        assume_yes=1; shift ;;
@@ -449,6 +708,8 @@ _cmd_install() {
             --no-sigstore)   no_sigstore=1; shift ;;
             --keep-build)    keep_build=1; shift ;;
             --prefix)        prefix="$2"; shift 2 ;;
+            --dry-run)       dry_run=1; shift ;;
+            --force)         force=1; shift ;;
             -h|--help)       _cmd_help; return 0 ;;
             -*)              _die "unknown flag: $1" ;;
             *)
@@ -467,13 +728,6 @@ _cmd_install() {
 
     prefix="${prefix:-${_PYINSTALL_PREFIX_ROOT}/${version}}"
 
-    if [[ -x "$prefix/bin/python${version%.*}" ]]; then
-        _log "$version already installed at $prefix — skipping"
-        return 0
-    fi
-
-    _check_deps || _die "missing dependencies; see: pyinstall deps"
-
     if [[ -z "$jobs" ]]; then
         if [[ "$_PYINSTALL_OS" == "macos" ]]; then
             jobs=$(sysctl -n hw.ncpu)
@@ -482,12 +736,45 @@ _cmd_install() {
         fi
     fi
 
-    _log "Plan: install CPython $version to $prefix, make -j$jobs"
+    # Run dep check so the plan can show per-item status; don't abort yet —
+    # the plan tells the user what's missing.
+    _check_deps || true
+
+    _render_install_plan "$version" "$prefix" "$jobs" "$no_sigstore" "$force" "$keep_build"
+
+    if (( dry_run )); then
+        # Exit nonzero if the install would fail at preconditions; otherwise 0.
+        if (( ${#_PYINSTALL_DEPS_MISSING} )); then
+            _err "dry-run: would fail — missing dependencies"
+            return 1
+        fi
+        if _install_would_clobber "$prefix" "$version" "$force"; then
+            _err "dry-run: would fail — prefix exists"
+            return 1
+        fi
+        _log "dry-run: plan is executable"
+        return 0
+    fi
+
+    if (( ${#_PYINSTALL_DEPS_MISSING} )); then
+        _err "Missing dependencies: ${_PYINSTALL_DEPS_MISSING[*]}"
+        _err "Run 'pyinstall deps' to see the install command for your OS."
+        return 1
+    fi
+
+    if _install_would_clobber "$prefix" "$version" "$force"; then
+        return 1
+    fi
+
     if (( ! assume_yes )); then
         print -n -u2 -- "Proceed? [y/N] "
         local ans
         read -r ans
         [[ "$ans" == y* || "$ans" == Y* ]] || _die "aborted"
+    fi
+
+    if (( force )); then
+        _move_prefix_aside "$prefix" || return 1
     fi
 
     _mkcache
@@ -521,7 +808,11 @@ _cmd_install() {
 
     popd >/dev/null
 
-    _post_install_checks "$version" "$prefix"
+    if ! _post_install_checks "$version" "$prefix"; then
+        # Keep the build tree so the user can inspect.
+        _warn "Keeping build tree for inspection: $builddir"
+        return 1
+    fi
 
     if (( ! keep_build )); then
         _log "Cleaning build tree"
@@ -529,7 +820,6 @@ _cmd_install() {
     fi
 
     _log "Installed $version at $prefix"
-    _log "Run 'pyrefresh' in your interactive shell to pick it up."
 }
 
 _cmd_upgrade() {
@@ -549,16 +839,24 @@ _cmd_upgrade() {
         current="$v"
     done
 
-    if [[ -z "$current" ]]; then
-        _log "$minor not installed locally; installing $latest"
-    elif [[ "$current" == "$latest" ]]; then
+    if [[ -n "$current" ]] && [[ "$current" == "$latest" ]]; then
         _log "$minor is already up to date ($current)"
         return 0
-    else
-        _log "Upgrading $minor: $current → $latest"
     fi
 
+    # Thread context into the plan renderer.
+    _PYINSTALL_ACTION="upgrade"
+    _PYINSTALL_UPGRADE_MINOR="$minor"
+    _PYINSTALL_UPGRADE_FROM="$current"
+
     _cmd_install "$latest" "$@"
+    local rc=$?
+
+    # Reset so subsequent calls don't inherit stale context.
+    _PYINSTALL_ACTION=""
+    _PYINSTALL_UPGRADE_MINOR=""
+    _PYINSTALL_UPGRADE_FROM=""
+    return $rc
 }
 
 _cmd_help() {
@@ -579,6 +877,8 @@ Subcommands:
 Install/upgrade flags:
   -y, --yes              Skip confirmation prompt
   -j, --jobs N           make -j N (default: detected)
+  --dry-run              Print the install plan and exit without building
+  --force                If the prefix already exists, move it aside and rebuild
   --no-sigstore          Skip Sigstore verification (3.14+ falls back to TLS-only)
   --keep-build           Keep build tree after successful install
   --prefix DIR           Override install prefix (default: ~/opt/python/<version>)

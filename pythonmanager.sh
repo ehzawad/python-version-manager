@@ -1713,11 +1713,21 @@ pyinstall() {
         "$script" "$@"
     fi
     local rc=$?
-    # install/upgrade may have added a new interpreter — invalidate the cache so
-    # the next python3.X / pyinfo / setpy call sees it without a shell reload.
+    # install/upgrade may have added a new interpreter — call pyrefresh so the
+    # user gets immediate confirmation that the current shell sees it, without
+    # having to reload. Skip on --dry-run (no filesystem change).
     if (( rc == 0 )); then
         case "${1:-}" in
-            install|upgrade) _PYTHONS_SCANNED=0 ;;
+            install|upgrade)
+                local arg is_dry=0
+                for arg in "$@"; do
+                    [[ "$arg" == "--dry-run" ]] && { is_dry=1; break; }
+                done
+                if (( ! is_dry )); then
+                    echo ""
+                    pyrefresh
+                fi
+                ;;
         esac
     fi
     return $rc
