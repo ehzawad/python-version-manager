@@ -965,7 +965,11 @@ _render_install_plan() {
         [[ -n "$argline" ]] && cfg_args+=("$argline")
     done < <(_plan_configure_args "$prefix")
     print -u2 -- "    ./configure ${cfg_args[*]}"
-    print -u2 -- "  Make:         make -j${jobs} && make altinstall"
+    print -u2 -- "  Make:         make -j${jobs} && make ${_PYINSTALL_MAKE_MODE:-altinstall}"
+    if [[ "${_PYINSTALL_MAKE_MODE:-altinstall}" == "install" ]]; then
+        print -u2 -- "                (--make-install: also creates unversioned \`python\` and \`python3\` symlinks"
+        print -u2 -- "                 in ${prefix}/bin pointing to python${mm})"
+    fi
     print -u2 -- ""
 
     # --- Install ---
@@ -1038,6 +1042,10 @@ _cmd_install() {
     local version="" jobs="" prefix=""
     local allow_tls_only=0 keep_build=0 assume_yes=0 dry_run=0 force=0
     local sigstore_identity="" sigstore_issuer=""
+    # Default to `make altinstall` per the CPython devguide; `--make-install`
+    # switches to `make install` which also creates unversioned `python3` and
+    # `python` symlinks in the prefix's bin dir.
+    typeset -g _PYINSTALL_MAKE_MODE="altinstall"
     while (( $# )); do
         case "$1" in
             -y|--yes)              assume_yes=1; shift ;;
@@ -1049,6 +1057,8 @@ _cmd_install() {
             --prefix)              prefix="$2"; shift 2 ;;
             --dry-run)             dry_run=1; shift ;;
             --force)               force=1; shift ;;
+            --make-install)        _PYINSTALL_MAKE_MODE="install"; shift ;;
+            --make-altinstall)     _PYINSTALL_MAKE_MODE="altinstall"; shift ;;
             -h|--help)             _cmd_help; return 0 ;;
             -*)                    _die "unknown flag: $1" ;;
             *)
@@ -1207,8 +1217,8 @@ _cmd_install() {
     _log "Running make -j$jobs (this takes a while; PGO+LTO) ..."
     make -j"$jobs" >&2
 
-    _log "Running make altinstall ..."
-    make altinstall >&2
+    _log "Running make ${_PYINSTALL_MAKE_MODE} ..."
+    make "$_PYINSTALL_MAKE_MODE" >&2
 
     popd >/dev/null
 
@@ -1283,6 +1293,12 @@ Install/upgrade flags:
   -j, --jobs N                  make -j N (default: detected)
   --dry-run                     Print the install plan and exit without building
   --force                       If the prefix already exists, move it aside and rebuild
+  --make-install                Use `make install` instead of `make altinstall`, so the
+                                prefix bin/ gets unversioned `python3` and `python`
+                                symlinks too (safe when each version has its own prefix;
+                                risky if multiple versions share one prefix like /usr/local)
+  --make-altinstall             (default) Use `make altinstall` — only versioned names
+                                like python3.14 end up in the prefix bin/
   --allow-tls-only              Skip Sigstore/GPG (3.14+ relies on TLS only) — use with caution
   --no-sigstore                 Alias for --allow-tls-only
   --sigstore-identity EMAIL     Override the expected cert-identity (for new series not in metadata)
