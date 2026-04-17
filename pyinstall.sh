@@ -320,14 +320,35 @@ _ensure_sigstore_venv() {
         rm -rf "$_PYINSTALL_SIGSTORE_VENV"
     fi
 
-    # Sigstore 3.3+ requires Python >= 3.10.
+    # Sigstore 3.3+ requires Python >= 3.10. Try direct filesystem paths
+    # FIRST so a stale pymanager wrapper (whose exec target may have been
+    # moved aside by --force on a different version) can't poison the lookup.
+    # Fall back to PATH-based candidates after.
     local cand py=""
-    for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10 /usr/bin/python3; do
-        if command -v "$cand" >/dev/null 2>&1 && \
-           "$cand" -c 'import sys; assert sys.version_info >= (3, 10)' 2>/dev/null; then
-            py=$(command -v "$cand")
-            break
+    local -a candidates=(
+        $HOME/opt/python/*/bin/python3.<10-99>(N)
+        /opt/python/*/bin/python3.<10-99>(N)
+        /opt/homebrew/opt/python@3.<10-99>/bin/python3.<10-99>(N)
+        /opt/homebrew/bin/python3.<10-99>(N)
+        /usr/local/opt/python@3.<10-99>/bin/python3.<10-99>(N)
+        /usr/local/bin/python3.<10-99>(N)
+        python3 python3.14 python3.13 python3.12 python3.11 python3.10
+    )
+    for cand in $candidates; do
+        # PATH-based lookup for unprefixed names
+        if [[ "$cand" != /* ]]; then
+            cand=$(command -v "$cand" 2>/dev/null) || continue
         fi
+        [[ -x "$cand" ]] || continue
+        # Skip pymanager wrapper scripts — they may exec a path that was just
+        # moved aside by --force.
+        if [[ "${cand:h}" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]]; then
+            continue
+        fi
+        "$cand" -c 'import sys; assert sys.version_info >= (3, 10)' 2>/dev/null && {
+            py="$cand"
+            break
+        }
     done
     [[ -n "$py" ]] || { _warn "No Python >= 3.10 available to bootstrap the Sigstore venv"; return 1; }
 
