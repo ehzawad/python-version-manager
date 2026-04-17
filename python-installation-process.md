@@ -44,13 +44,14 @@ BOOTSTRAP_PY=$(command -v python3 || command -v python3.13 || command -v python3
 "$BOOTSTRAP_PY" -m venv ~/.cache/sigstore-venv
 ~/.cache/sigstore-venv/bin/pip install --quiet sigstore
 
-# Expected signer identity for the 3.14/3.15 series is hugo@python.org via
-# GitHub's OIDC issuer. The current mapping is published at
-# https://www.python.org/downloads/metadata/sigstore/ — confirm before trusting.
+# Signer identity and OIDC issuer vary per release manager. The authoritative
+# mapping is at https://www.python.org/downloads/metadata/sigstore/ — confirm
+# there before trusting. Current values for 3.14/3.15 (hugo@python.org, signed
+# interactively via GitHub's OAuth flow, not via GitHub Actions CI):
 ~/.cache/sigstore-venv/bin/python -m sigstore verify identity \
   --bundle "Python-${PYVER}.tgz.sigstore" \
   --cert-identity "hugo@python.org" \
-  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --cert-oidc-issuer "https://github.com/login/oauth" \
   "Python-${PYVER}.tgz"
 ```
 
@@ -58,10 +59,17 @@ BOOTSTRAP_PY=$(command -v python3 || command -v python3.13 || command -v python3
 
 ```bash
 curl -O "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tgz.asc"
-# Release-manager key fingerprint for 3.13.x is Thomas Wouters'; see
-# https://www.python.org/downloads/metadata/pgp/ for the current mapping.
-gpg --keyserver keys.openpgp.org --recv-keys A035C8C19219BA821ECEA86B64E628F8D68469693D3F93B29109B3CF
+# Release-manager key fingerprints are at
+# https://www.python.org/downloads/metadata/pgp/. For 3.12.x / 3.13.x the
+# signer is Thomas Wouters, full fingerprint 7169605F62C751356D054A26A821E680E5FA6305,
+# distributed from https://github.com/Yhg1s.gpg.
+# Import from the pinned URL (stronger than keyserver TOFU):
+curl -fsSL https://github.com/Yhg1s.gpg | gpg --import
 gpg --verify "Python-${PYVER}.tgz.asc" "Python-${PYVER}.tgz"
+# For 3.10.x / 3.11.x use Pablo Galindo's key
+# (A035C8C19219BA821ECEA86B64E628F8D684696D, https://keybase.io/pablogsal/pgp_keys.asc).
+# For 3.8.x / 3.9.x use Łukasz Langa's key
+# (E3FF2839C048B25C084DEBE9B26995E310250568, https://keybase.io/ambv/pgp_keys.asc).
 ```
 
 #### Then extract

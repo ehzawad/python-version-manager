@@ -392,63 +392,173 @@ _verify_sigstore() {
     return 1
 }
 
+# Managed GPG home so we don't pollute the user's default keyring. Created on
+# demand with mode 700. Cleaned up is out of scope — the keys are small.
+_pymanager_gnupg_home() {
+    print -- "$_PYINSTALL_CACHE/gnupg"
+}
+
+_ensure_gnupg_home() {
+    local d
+    d=$(_pymanager_gnupg_home)
+    [[ -d "$d" ]] && return 0
+    mkdir -p "$d" || return 1
+    chmod 700 "$d"
+}
+
+# Per-minor signer map, sourced from https://www.python.org/downloads/metadata/pgp/.
+# Each call prints "<name>\t<email>\t<fingerprint>\t<key_url>".
+# If the minor has no mapping (e.g. 3.14+ which is Sigstore-only), returns 1.
+# Fingerprints are full 40-char SHA-1; short key IDs are insecure for pinning.
+_gpg_signer_for() {
+    local minor="$1"
+    case "$minor" in
+        3.12|3.13)
+            # Thomas Wouters — key linked from the python.org PGP page via
+            # https://github.com/Yhg1s.gpg (the "Yhg1s" moniker is Thomas).
+            print -- "Thomas Wouters\tthomas@python.org\t7169605F62C751356D054A26A821E680E5FA6305\thttps://github.com/Yhg1s.gpg"
+            ;;
+        3.10|3.11)
+            # Pablo Galindo Salgado — keybase link from python.org PGP page.
+            print -- "Pablo Galindo Salgado\tpablogsal@python.org\tA035C8C19219BA821ECEA86B64E628F8D684696D\thttps://keybase.io/pablogsal/pgp_keys.asc"
+            ;;
+        3.8|3.9)
+            # Łukasz Langa — keybase link from python.org PGP page.
+            print -- "Łukasz Langa\tlukasz@langa.pl\tE3FF2839C048B25C084DEBE9B26995E310250568\thttps://keybase.io/ambv/pgp_keys.asc"
+            ;;
+        3.7)
+            # Ned Deily — macOS-binaries key (the one that signed 3.7.x source).
+            print -- "Ned Deily\tnad@python.org\tC9B104B3DD3AA72D7CCB1066FB9921286F5E1540\thttps://keybase.io/nad/pgp_keys.asc"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Import an expected key. Tries the pinned per-signer URL first (direct
+# HTTPS, matches what's linked from python.org). Falls back to
+# keys.openpgp.org via the keyserver protocol. Either way, asserts the
+# expected full fingerprint ends up in the managed keyring.
+_ensure_gpg_key() {
+    local expected_fpr="$1" key_url="$2"
+    local gh
+    gh=$(_pymanager_gnupg_home)
+
+    # Fast path: key already present in the managed keyring.
+    if gpg --homedir "$gh" --with-colons --fingerprint "$expected_fpr" \
+            >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local tmpkey="${gh}/_fetching.asc.$$"
+    if [[ -n "$key_url" ]] && _fetch_text "$key_url" "$tmpkey" 2>/dev/null; then
+        if gpg --homedir "$gh" --import "$tmpkey" >/dev/null 2>&1; then
+            rm -f "$tmpkey"
+            # Verify the imported key matches the expected fingerprint.
+            if gpg --homedir "$gh" --with-colons --fingerprint "$expected_fpr" \
+                    >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    fi
+    rm -f "$tmpkey" 2>/dev/null
+
+    # Fallback: keys.openpgp.org keyserver.
+    if gpg --homedir "$gh" --keyserver keys.openpgp.org \
+            --recv-keys "$expected_fpr" >/dev/null 2>&1; then
+        if gpg --homedir "$gh" --with-colons --fingerprint "$expected_fpr" \
+                >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 _verify_gpg() {
     # Verification for Python 3.13.x and older. Release-manager fingerprints
-    # are published at https://www.python.org/downloads/metadata/pgp/.
+    # are pinned per-minor from https://www.python.org/downloads/metadata/pgp/.
+    # Returns 0 only when gpg reports VALIDSIG with the expected full fingerprint.
     local version="$1" tarball="$2"
+    local mm="${version%.*}"
     command -v gpg >/dev/null 2>&1 || { _warn "gpg not installed"; return 1; }
+
+    local signer_line name email expected_fpr key_url
+    if ! signer_line=$(_gpg_signer_for "$mm"); then
+        _err "No GPG signer mapping for Python $mm"
+        return 1
+    fi
+    IFS=$'\t' read -r name email expected_fpr key_url <<< "$signer_line"
 
     local base="https://www.python.org/ftp/python/${version}"
     local sig="${tarball}.asc"
     _log "Fetching OpenPGP signature ..."
     _fetch "${base}/${tarball:t}.asc" "$sig" || {
-        _warn "No .asc signature published for $version"
+        _err "No .asc signature published for $version"
         return 1
     }
 
-    # Short key IDs are insecure; use full fingerprints. This set covers
-    # recent release managers; extend as new series appear.
-    local fpr
-    local -a fingerprints=(
-        "A035C8C19219BA821ECEA86B64E628F8D68469"   # Ned Deily (legacy)
-        "E3FF2839C048B25C084DEBE9B26995E310250568" # Łukasz Langa
-        "A821A8B57C6BB0BC0CB0C2D84735AE3F47EDFEE"  # Pablo Galindo
-        "FB9921286F5E1540E929C4208A76DC37F2175DB0" # Thomas Wouters
-    )
-    _log "Importing release-manager keys ..."
-    for fpr in $fingerprints; do
-        gpg --keyserver keys.openpgp.org --recv-keys "$fpr" 2>/dev/null || true
-    done
+    _ensure_gnupg_home || { _err "Could not create GPG home"; return 1; }
+    local gh
+    gh=$(_pymanager_gnupg_home)
 
-    _log "Verifying OpenPGP signature ..."
-    gpg --verify "$sig" "$tarball" >&2 && {
-        _log "GPG verification OK"
+    _log "Importing release-manager key ($name)..."
+    if ! _ensure_gpg_key "$expected_fpr" "$key_url"; then
+        _err "Failed to obtain expected GPG key:"
+        _err "  Signer: $name <$email>"
+        _err "  Key:    $expected_fpr"
+        _err "  Source: $key_url"
+        _err "Tried $key_url and keys.openpgp.org; both failed or produced a different fingerprint."
+        return 1
+    fi
+
+    _log "Verifying OpenPGP signature:"
+    _log "  signer: $name <$email>"
+    _log "  key:    $expected_fpr"
+
+    # --status-fd 1 emits machine-readable status lines. We assert a
+    # VALIDSIG line with the exact expected full fingerprint — a plain exit 0
+    # from gpg --verify could pass on a different key that happens to be in
+    # the keyring.
+    local gpg_status
+    gpg_status=$(gpg --homedir "$gh" --status-fd 1 --verify "$sig" "$tarball" 2>&1)
+    if [[ "$gpg_status" == *"[GNUPG:] VALIDSIG ${expected_fpr} "* ]] || \
+       [[ "$gpg_status" == *"[GNUPG:] VALIDSIG ${expected_fpr}"$'\n'* ]]; then
+        _log "GPG verification OK (VALIDSIG $expected_fpr)"
         return 0
-    }
-    _err "GPG verification failed"
+    fi
+
+    _err "GPG verification failed for ${tarball:t}"
+    _err "Expected VALIDSIG $expected_fpr was not emitted."
+    _err "gpg status output:"
+    print -u2 -- "$gpg_status" | sed 's/^/  /'
     return 1
 }
 
 _verify_tarball() {
     # Choose the right verification path by version. --allow-tls-only
     # (alias: --no-sigstore) forces TLS-only. --sigstore-identity and
-    # --sigstore-issuer together override the metadata lookup.
+    # --sigstore-issuer together override the Sigstore metadata lookup.
+    #
+    # Policy: both paths fail-closed. A previous version silently fell back
+    # to TLS-only on GPG failure, which hid real verification failures.
     local version="$1" tarball="$2" allow_tls_only="$3"
     local override_identity="${4:-}" override_issuer="${5:-}"
     local mm="${version%.*}"
     local minor="${mm#*.}"
 
+    if (( allow_tls_only )); then
+        _warn "Skipping cryptographic verification (--allow-tls-only); relying on TLS integrity only for $version"
+        return 0
+    fi
+
     if (( minor >= 14 )); then
-        if (( allow_tls_only )); then
-            _warn "Skipping Sigstore by request (--allow-tls-only); relying on TLS integrity only for $version"
-            return 0
-        fi
         _verify_sigstore "$version" "$tarball" "$override_identity" "$override_issuer" && return 0
         _die "Sigstore verification failed for $version; pass --allow-tls-only to bypass at your own risk"
     else
         _verify_gpg "$version" "$tarball" && return 0
-        _warn "GPG verification failed or unavailable; proceeding with TLS-only integrity"
-        return 0
+        _die "GPG verification failed for $version; pass --allow-tls-only to bypass at your own risk"
     fi
 }
 
@@ -790,11 +900,35 @@ _render_install_plan() {
             fi
         fi
     else
-        if command -v gpg >/dev/null 2>&1; then
+        if (( allow_tls_only )); then
+            print -u2 -- "  Method:       TLS-only (--allow-tls-only)"
+            print -u2 -- "  Signature:    skipped — no cryptographic release-manager verification"
+        elif command -v gpg >/dev/null 2>&1; then
             print -u2 -- "  Method:       OpenPGP (.asc) via gpg"
-            print -u2 -- "  Keyserver:    keys.openpgp.org"
+            local gpg_line gpg_name gpg_email gpg_fpr gpg_url
+            if gpg_line=$(_gpg_signer_for "$mm" 2>/dev/null); then
+                IFS=$'\t' read -r gpg_name gpg_email gpg_fpr gpg_url <<< "$gpg_line"
+                # Pretty-print the fingerprint in 4-char groups (like gpg does).
+                local pretty_fpr
+                pretty_fpr=$(print -- "$gpg_fpr" | sed -E 's/(.{4})/\1 /g' | sed 's/ $//')
+                print -u2 -- "  Signer:       $gpg_name <$gpg_email>"
+                print -u2 -- "  Key:          $pretty_fpr"
+                print -u2 -- "  Key source:   $gpg_url (falls back to keys.openpgp.org)"
+                local gh
+                gh=$(_pymanager_gnupg_home)
+                if [[ -d "$gh" ]] && gpg --homedir "$gh" --with-colons --fingerprint "$gpg_fpr" >/dev/null 2>&1; then
+                    print -u2 -- "  Keyring:      $gh (key present)"
+                else
+                    print -u2 -- "  Keyring:      $gh (will fetch on verify)"
+                fi
+                print -u2 -- "  Policy:       fail-closed; pass --allow-tls-only to bypass"
+            else
+                print -u2 -- "  Signer:       UNKNOWN — no mapping for $mm"
+                print -u2 -- "  Policy:       install will fail unless --allow-tls-only is passed"
+            fi
         else
-            print -u2 -- "  Method:       TLS-only (gpg not installed)"
+            print -u2 -- "  Method:       gpg not installed"
+            print -u2 -- "  Policy:       install will fail unless --allow-tls-only is passed"
         fi
     fi
     print -u2 -- ""
