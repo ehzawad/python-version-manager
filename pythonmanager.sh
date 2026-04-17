@@ -22,19 +22,31 @@
 # Diagnostics: Run 'pydiag'
 #
 # Global variables
+#
+# Two categories:
+#  1. Caches/flags we DO reset on every source (so stale data is invalidated).
+#  2. User state (override, build mode, wrapper dir) we DO NOT reset, so that
+#     re-sourcing ~/.zshrc in the same shell preserves an active setpy session.
+#
+# `typeset -g VAR` without `=value` declares the variable globally but keeps its
+# existing value if any. On a fresh shell the integer type defaults to 0, the
+# scalar type to empty.
 typeset -ga _PYTHON_VERSIONS
 typeset -gA _PYTHON_PATHS
 typeset -gA _PYTHON_INFO
+# Caches — safe to clear on re-source.
 typeset -g _VENV_PYTHON_VERSION_CACHE=""
 typeset -g _LAST_VIRTUAL_ENV=""
-typeset -g _PYTHONS_SCANNED=0
-typeset -g _PYTHON_OVERRIDE=""
+typeset -gi _PYTHONS_SCANNED=0
 typeset -gi _PYTHON_MANAGER_READY=0
-typeset -g _PYTHON_BUILD_MODE=0
-typeset -g _PYMANAGER_LAST_SET_BIN_DIR=""
-typeset -g _PYMANAGER_LAST_WRAPPER_DIR=""
-typeset -gi _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
-typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
+# User/session state — preserve across re-source in the same shell.
+typeset -g _PYTHON_OVERRIDE
+typeset -gi _PYTHON_BUILD_MODE
+typeset -g _PYMANAGER_LAST_SET_BIN_DIR
+typeset -g _PYMANAGER_LAST_WRAPPER_DIR
+# Legacy; retained for downward compat with shells that sourced an older version.
+typeset -gi _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET
+typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
 
 # === EARLY PATH SETUP (runs on source, before functions are defined) ===
 # This ensures login shells get correct PATH even without full function loading.
@@ -62,10 +74,13 @@ typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
     local _rest="${PATH#*:}"
     [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
 
-    # Venv bin should be first, OR second if a pymanager wrapper is first
+    # Venv bin should be first, OR second if a pymanager wrapper is first.
+    # Wrapper dir pattern matches both new (pymanager.XXXXXXXX from mktemp) and
+    # legacy (pymanager-<pid>) schemes so inherited wrappers from parent shells
+    # running older versions are still recognized during transition.
     if [[ "$_first_path" == "$VIRTUAL_ENV/bin" ]]; then
       : # OK - venv is first
-    elif [[ "$_first_path" =~ ^/tmp/pymanager-[0-9]+/bin$ ]] && \
+    elif [[ "$_first_path" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]] && \
          [[ "$_second_path" == "$VIRTUAL_ENV/bin" ]]; then
       : # OK - pymanager wrapper first, venv second
     else
@@ -80,7 +95,7 @@ typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
 
     if [[ "$_first_path" == "$CONDA_PREFIX/bin" ]]; then
       : # OK - conda is first
-    elif [[ "$_first_path" =~ ^/tmp/pymanager-[0-9]+/bin$ ]] && \
+    elif [[ "$_first_path" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]] && \
          [[ "$_second_path" == "$CONDA_PREFIX/bin" ]]; then
       : # OK - pymanager wrapper first, conda second
     else
@@ -96,7 +111,7 @@ typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
     local _pymanager_existing_wrapper=""
     local dir
     for dir in $path; do
-      if [[ "$dir" =~ ^/tmp/pymanager-[0-9]+/bin$ ]]; then
+      if [[ "$dir" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]]; then
         _pymanager_existing_wrapper="$dir"
         break
       fi
@@ -179,8 +194,10 @@ _scan_all_pythons() {
             # Find ALL python executables
             for py in "$dir"/python*(N); do
                 [[ -x "$py" ]] || continue
-                [[ "$py" =~ "python-config" ]] && continue
-                [[ "$py" =~ "pythonw" ]] && continue
+                # Skip config helpers (python-config, python3-config, python3.14-config, ...)
+                [[ "${py:t}" == *-config ]] && continue
+                # Skip windowed interpreter (pythonw, pythonw3.X)
+                [[ "${py:t}" == pythonw* ]] && continue
 
                 python_executables+=("$py")
             done
@@ -296,45 +313,30 @@ _scan_all_pythons() {
     _PYTHONS_SCANNED=1
 }
 
-# Check if we're in a virtual environment
-_in_virtual_env() {
-    # Standard venv/virtualenv
-    [[ -n "$VIRTUAL_ENV" ]] && return 0
+# Detect a venv-like layout by following PATH's python binary.
+# Returns (prints) the detected dir path; no side effects on env vars.
+_detect_venv_from_path() {
+    local python_path=$(whence -p python 2>/dev/null)
+    [[ -n "$python_path" ]] && [[ -x "$python_path" ]] || return 1
+    [[ "$python_path" =~ /bin/python ]] || return 1
+    local venv_dir="${python_path%/bin/python*}"
+    [[ -f "$venv_dir/bin/activate" ]] && [[ -f "$venv_dir/pyvenv.cfg" ]] || return 1
+    echo "$venv_dir"
+}
 
-    # Conda
+# Check if we're in a virtual environment. Pure predicate — no env mutation.
+_in_virtual_env() {
+    [[ -n "$VIRTUAL_ENV" ]] && return 0
     [[ -n "$CONDA_PREFIX" ]] && return 0
     [[ -n "$CONDA_DEFAULT_ENV" ]] && return 0
-
-    # Poetry
     [[ -n "$POETRY_ACTIVE" ]] && return 0
-
-    # Pipenv
     [[ -n "$PIPENV_ACTIVE" ]] && return 0
-
-    # Heuristic: Check if python command points to a venv-like structure
-    # This helps detect venvs created by sandboxed environments
-    # Use whence -p to get actual binary path (command -v returns function name if defined)
-    local python_path=$(whence -p python 2>/dev/null)
-    if [[ -n "$python_path" ]] && [[ -x "$python_path" ]]; then
-        # Check if python is in a bin/ directory with activate script
-        if [[ "$python_path" =~ /bin/python ]]; then
-            local venv_dir="${python_path%/bin/python*}"
-            # Validate this looks like a venv (has activate script and pyvenv.cfg)
-            if [[ -f "$venv_dir/bin/activate" ]] && [[ -f "$venv_dir/pyvenv.cfg" ]]; then
-                # Temporarily set VIRTUAL_ENV if not already set
-                # This helps the rest of the script work correctly
-                if [[ -z "$VIRTUAL_ENV" ]]; then
-                    export VIRTUAL_ENV="$venv_dir"
-                fi
-                return 0
-            fi
-        fi
-    fi
-
-    return 1
+    _detect_venv_from_path >/dev/null 2>&1
 }
 
 # Get the active environment's bin directory (venv or conda), if any.
+# Falls back to the PATH-based venv heuristic so callers can use this even when
+# VIRTUAL_ENV isn't explicitly exported by an activate script.
 _py_manager_env_bin_dir() {
     if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
         echo "$VIRTUAL_ENV/bin"
@@ -342,6 +344,11 @@ _py_manager_env_bin_dir() {
     fi
     if [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
         echo "$CONDA_PREFIX/bin"
+        return 0
+    fi
+    local detected
+    if detected=$(_detect_venv_from_path 2>/dev/null); then
+        echo "$detected/bin"
         return 0
     fi
     return 1
@@ -771,6 +778,100 @@ pip3() {
     return 1
 }
 
+# === Wrapper dir helpers ===
+#
+# Policy: wrapper dirs live under $TMPDIR (or /tmp) with mktemp-generated names,
+# mode 0700, and an .owner file recording the PID that owns them. Cleanup on
+# shell exit via zshexit_functions; orphans from crashed shells are pruned
+# opportunistically at source time.
+
+# POSIX single-quote escape: emit 'STRING' with embedded single quotes as '\''
+_pymanager_shell_quote() {
+    local s="$1"
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
+# Write an executable shell wrapper that execs TARGET with optional leading args
+# followed by "$@". All path/args are safely quoted.
+#   _pymanager_write_exec_wrapper OUT TARGET [ARG ...]
+_pymanager_write_exec_wrapper() {
+    local out="$1" target="$2"
+    shift 2
+    local qt
+    qt=$(_pymanager_shell_quote "$target")
+    local extra="" a
+    for a in "$@"; do
+        extra+=" $(_pymanager_shell_quote "$a")"
+    done
+    printf '#!/bin/sh\nexec %s%s "$@"\n' "$qt" "$extra" > "$out"
+    chmod +x "$out"
+}
+
+# Create a fresh, securely-named wrapper dir under $TMPDIR with mode 0700.
+# Writes the owner PID to .owner for later orphan detection. Prints the dir path.
+_pymanager_make_wrapper_dir() {
+    local base="${TMPDIR:-/tmp}"
+    # Strip any trailing slash so mktemp doesn't produce double-slashes
+    base="${base%/}"
+    local d
+    d=$(umask 077 && mktemp -d "$base/pymanager.XXXXXXXX" 2>/dev/null) || return 1
+    mkdir -p "$d/bin" 2>/dev/null || { rm -rf "$d" 2>/dev/null; return 1; }
+    printf '%s\n' "$$" > "$d/.owner"
+    echo "$d"
+}
+
+# Remove a specific wrapper dir if it looks like one of ours (name matches the
+# pymanager.XXXXXXXX or legacy pymanager-PID scheme, owner file records a PID).
+_pymanager_cleanup_wrapper_dir() {
+    local d="$1"
+    [[ -n "$d" ]] && [[ -d "$d" ]] || return 0
+    # Require the name to match our scheme to avoid wild rm -rf under a misset var.
+    [[ "${d:t}" =~ ^pymanager[-.][A-Za-z0-9_]+$ ]] || return 0
+    rm -rf "$d" 2>/dev/null
+}
+
+# Cleanup hook fired on shell exit via zshexit_functions.
+_pymanager_cleanup_current_wrapper() {
+    [[ -n "${_PYMANAGER_LAST_WRAPPER_DIR:-}" ]] || return 0
+    _pymanager_cleanup_wrapper_dir "$_PYMANAGER_LAST_WRAPPER_DIR"
+    _PYMANAGER_LAST_WRAPPER_DIR=""
+}
+
+# Opportunistic cleanup of orphan wrapper dirs whose owner PID is no longer
+# alive. Runs at source time; cheap; bounded by the number of pymanager.* dirs
+# under $TMPDIR and /tmp. Only touches dirs we recognize by name.
+_pymanager_cleanup_orphan_wrappers() {
+    local base d owner
+    for base in "${TMPDIR:-/tmp}" /tmp; do
+        base="${base%/}"
+        [[ -d "$base" ]] || continue
+        for d in "$base"/pymanager.*(N/) "$base"/pymanager-<->(N/); do
+            [[ -d "$d" ]] || continue
+            # Only prune if we can read the owner PID and it is not a live process
+            if [[ -f "$d/.owner" ]]; then
+                owner=$(<"$d/.owner")
+                [[ "$owner" == <-> ]] || continue
+                # Do not remove our own shell's dir
+                (( owner == $$ )) && continue
+                # kill -0 returns 0 if process exists and we can signal it
+                if ! kill -0 "$owner" 2>/dev/null; then
+                    rm -rf "$d" 2>/dev/null
+                fi
+            else
+                # Legacy dirs with no .owner: only prune if name encodes PID and
+                # that PID is dead.
+                if [[ "${d:t}" =~ ^pymanager-([0-9]+)$ ]]; then
+                    owner="${match[1]}"
+                    (( owner == $$ )) && continue
+                    if ! kill -0 "$owner" 2>/dev/null; then
+                        rm -rf "$d" 2>/dev/null
+                    fi
+                fi
+            fi
+        done
+    done
+}
+
 # Set temporary Python default with AI tool support
 setpy() {
     if ! _py_manager_available; then
@@ -855,15 +956,13 @@ setpy() {
                 (( quiet )) || echo "Cleared Python override (was ${_PYTHON_OVERRIDE})."
                 _PYTHON_OVERRIDE=""
                 unset PYTHON PYTHON3
+                _PYMANAGER_LAST_SET_BIN_DIR=""
 
-                # Clean up temp wrapper directory
-                if [[ -n "$_PYMANAGER_LAST_WRAPPER_DIR" ]] && [[ -d "$_PYMANAGER_LAST_WRAPPER_DIR" ]]; then
-                    rm -rf "$_PYMANAGER_LAST_WRAPPER_DIR" 2>/dev/null
-                    # Remove from PATH
-                    if [[ -n "${ZSH_VERSION:-}" ]]; then
-                        path=(${path:#"$_PYMANAGER_LAST_WRAPPER_DIR/bin"})
-                        export PATH="${(j/:/)path}"
-                    fi
+                # Drop wrapper dir from PATH, then delete it.
+                if [[ -n "$_PYMANAGER_LAST_WRAPPER_DIR" ]]; then
+                    path=(${path:#"$_PYMANAGER_LAST_WRAPPER_DIR/bin"})
+                    export PATH="${(j/:/)path}"
+                    _pymanager_cleanup_wrapper_dir "$_PYMANAGER_LAST_WRAPPER_DIR"
                     _PYMANAGER_LAST_WRAPPER_DIR=""
                 fi
             fi
@@ -871,14 +970,15 @@ setpy() {
             if [[ $had_build_mode -eq 1 ]]; then
                 (( quiet )) || echo "Cleared build mode (pip is now blocked outside venvs)."
                 _PYTHON_BUILD_MODE=0
-                if (( _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET )); then
-                    export PIP_REQUIRE_VIRTUALENV="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV"
-                else
-                    unset PIP_REQUIRE_VIRTUALENV
-                fi
+                # Return PIP_REQUIRE_VIRTUALENV to the manager baseline (1).
+                # The manager is still loaded, so the policy "no pip outside venv"
+                # remains in effect until the shell exits.
+                export PIP_REQUIRE_VIRTUALENV=1
+                unset PYMANAGER_BUILD_MODE
+                # Legacy saved-value vars from older versions; safe to clear.
                 _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
                 _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
-                unset PYMANAGER_BUILD_MODE PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
+                unset PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
             fi
         else
             (( quiet )) || echo "No Python override or build mode is set."
@@ -951,8 +1051,8 @@ setpy() {
     local python_target="$python_path"
     if [[ -L "$python_target" ]]; then
         local count=0
+        local target
         while [[ -L "$python_target" ]] && (( count++ < 50 )); do
-            local target
             target=$(readlink "$python_target" 2>/dev/null) || break
             [[ "$target" != /* ]] && target="${python_target:h}/$target"
             python_target="$target"
@@ -996,95 +1096,89 @@ setpy() {
     export PYTHON="$python_target"
     export PYTHON3="$python_target"
 
-    # Create session-scoped temp wrapper scripts for subprocess compatibility
-    # This makes python/python3 available to subprocesses (Claude Code, Codex, etc.)
-    # without creating persistent symlinks
-    local wrapper_dir="/tmp/pymanager-$$"
-    mkdir -p "$wrapper_dir/bin" 2>/dev/null
+    # Create session-scoped wrapper scripts for subprocess compatibility.
+    # Subprocesses (Claude Code, Codex, etc.) don't inherit shell functions, so
+    # they need real binaries on PATH. Shell-script wrappers (not symlinks) are
+    # used so `python -m venv` records the real interpreter in pyvenv.cfg rather
+    # than the temp wrapper path, which would break venvs after cleanup.
+    local previous_wrapper_on_entry="${_PYMANAGER_LAST_WRAPPER_DIR:-}"
+    local wrapper_dir
+    wrapper_dir=$(_pymanager_make_wrapper_dir) || {
+        echo "Error: failed to create wrapper directory under ${TMPDIR:-/tmp}" >&2
+        return 1
+    }
 
-    # Create python wrapper
-    cat > "$wrapper_dir/bin/python" <<WRAPPER
-#!/bin/sh
-exec "$python_target" "\$@"
-WRAPPER
-    chmod +x "$wrapper_dir/bin/python"
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/python"             "$python_target"
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/python3"            "$python_target"
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/python${version}"   "$python_target"
 
-    # Create python3 wrapper
-    cat > "$wrapper_dir/bin/python3" <<WRAPPER
-#!/bin/sh
-exec "$python_target" "\$@"
-WRAPPER
-    chmod +x "$wrapper_dir/bin/python3"
+    # Pip wrappers route through `python -m pip` so PIP_REQUIRE_VIRTUALENV
+    # enforcement applies. These shadow any pipX.Y in $python_bin_dir because
+    # wrapper_dir comes first on PATH. They deliberately exist so subprocess
+    # `pip`/`pip3`/`pipX.Y` calls are routed through *our* chosen interpreter
+    # and *our* policy.
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/pip"            "$python_target" -m pip
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/pip3"           "$python_target" -m pip
+    _pymanager_write_exec_wrapper "$wrapper_dir/bin/pip${version}"  "$python_target" -m pip
 
-    # Also link the versioned python (e.g., python3.14)
-    ln -sf "$python_target" "$wrapper_dir/bin/python${version}" 2>/dev/null
-
-    # Update PATH: wrapper_dir first, then python_bin_dir (for pip3.X etc), then rest
-    # Keep active virtualenv/conda bins ahead of everything.
-    if [[ -n "${ZSH_VERSION:-}" ]]; then
-        local active_env_bin=""
-        if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
-            active_env_bin="$VIRTUAL_ENV/bin"
-        elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
-            active_env_bin="$CONDA_PREFIX/bin"
-        fi
-
-        local -a cleaned_path=()
-        local previous_wrapper_dir="${_PYMANAGER_LAST_WRAPPER_DIR:-}"
-        local previous_bin_dir="${_PYMANAGER_LAST_SET_BIN_DIR:-}"
-        local dir
-        for dir in $path; do
-            [[ "$dir" == "$wrapper_dir/bin" ]] && continue
-            [[ "$dir" == "$python_bin_dir" ]] && continue
-            [[ -n "$previous_wrapper_dir" ]] && [[ "$dir" == "$previous_wrapper_dir/bin" ]] && continue
-            [[ -n "$previous_bin_dir" ]] && [[ "$dir" == "$previous_bin_dir" ]] && continue
-            cleaned_path+=("$dir")
-        done
-
-        if [[ -n "$active_env_bin" ]] && (( ${cleaned_path[(I)$active_env_bin]} )); then
-            local -a new_path=()
-            local inserted=0
-            for dir in $cleaned_path; do
-                new_path+=("$dir")
-                if (( inserted == 0 )) && [[ "$dir" == "$active_env_bin" ]]; then
-                    new_path+=("$wrapper_dir/bin" "$python_bin_dir")
-                    inserted=1
-                fi
-            done
-            if (( inserted == 0 )); then
-                new_path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
-            fi
-            path=($new_path)
-        else
-            path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
-        fi
-        export PATH="${(j/:/)path}"
-        _PYMANAGER_LAST_WRAPPER_DIR="$wrapper_dir"
-        _PYMANAGER_LAST_SET_BIN_DIR="$python_bin_dir"
-    else
-        # Fallback for non-zsh
-        local cleaned_path="$PATH"
-        cleaned_path="${cleaned_path//:$wrapper_dir\/bin:/:}"
-        cleaned_path="${cleaned_path/#$wrapper_dir\/bin:/}"
-        cleaned_path="${cleaned_path/%:$wrapper_dir\/bin/}"
-        cleaned_path="${cleaned_path//:$python_bin_dir:/:}"
-        cleaned_path="${cleaned_path/#$python_bin_dir:/}"
-        cleaned_path="${cleaned_path/%:$python_bin_dir/}"
-        export PATH="$wrapper_dir/bin:$python_bin_dir:$cleaned_path"
+    # Update PATH: wrapper_dir first, then python_bin_dir (for python3-config, entry points).
+    # Keep active virtualenv/conda bins ahead of everything so venv's python/pip win.
+    local active_env_bin=""
+    if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+        active_env_bin="$VIRTUAL_ENV/bin"
+    elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
+        active_env_bin="$CONDA_PREFIX/bin"
     fi
 
-    # Handle build mode
-    if [[ $build_mode -eq 1 ]]; then
-        if [[ $_PYTHON_BUILD_MODE -ne 1 ]]; then
-            _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=${+PIP_REQUIRE_VIRTUALENV}
-            _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV="${PIP_REQUIRE_VIRTUALENV-}"
-            export PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET"
-            export PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV"
-            export PYMANAGER_BUILD_MODE=1
+    local -a cleaned_path=()
+    local previous_wrapper_dir="${_PYMANAGER_LAST_WRAPPER_DIR:-}"
+    local previous_bin_dir="${_PYMANAGER_LAST_SET_BIN_DIR:-}"
+    local dir
+    for dir in $path; do
+        [[ "$dir" == "$wrapper_dir/bin" ]] && continue
+        [[ "$dir" == "$python_bin_dir" ]] && continue
+        [[ -n "$previous_wrapper_dir" ]] && [[ "$dir" == "$previous_wrapper_dir/bin" ]] && continue
+        [[ -n "$previous_bin_dir" ]] && [[ "$dir" == "$previous_bin_dir" ]] && continue
+        cleaned_path+=("$dir")
+    done
+
+    if [[ -n "$active_env_bin" ]] && (( ${cleaned_path[(I)$active_env_bin]} )); then
+        local -a new_path=()
+        local inserted=0
+        for dir in $cleaned_path; do
+            new_path+=("$dir")
+            if (( inserted == 0 )) && [[ "$dir" == "$active_env_bin" ]]; then
+                new_path+=("$wrapper_dir/bin" "$python_bin_dir")
+                inserted=1
+            fi
+        done
+        if (( inserted == 0 )); then
+            new_path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
         fi
+        path=($new_path)
+    else
+        path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
+    fi
+    export PATH="${(j/:/)path}"
+    _PYMANAGER_LAST_WRAPPER_DIR="$wrapper_dir"
+    _PYMANAGER_LAST_SET_BIN_DIR="$python_bin_dir"
+
+    # Remove the previous wrapper dir now that PATH no longer references it.
+    if [[ -n "$previous_wrapper_on_entry" ]] && [[ "$previous_wrapper_on_entry" != "$wrapper_dir" ]]; then
+        _pymanager_cleanup_wrapper_dir "$previous_wrapper_on_entry"
+    fi
+
+    # Build mode flips PIP_REQUIRE_VIRTUALENV off so pip works outside a venv.
+    # The manager baseline (set at source time) keeps it on otherwise, which is
+    # what enforces the "no pip outside venv" policy across subprocesses.
+    if [[ $build_mode -eq 1 ]]; then
         _PYTHON_BUILD_MODE=1
-        # This env var tells pip it's okay to run outside venv (for subprocesses)
+        export PYMANAGER_BUILD_MODE=1
         export PIP_REQUIRE_VIRTUALENV=0
+    else
+        # Plain setpy (no --build): ensure baseline is re-asserted in case the
+        # caller nuked it between sessions.
+        export PIP_REQUIRE_VIRTUALENV=1
     fi
     if (( ! quiet )); then
         echo "Set Python ${version} for this session."
@@ -1848,24 +1942,57 @@ which() {
 (( _PYTHON_MANAGER_READY = 1 ))
 
 
-# Clear inherited build mode when starting a new interactive shell session.
-# This prevents "build mode" from leaking into child shells via exported env vars.
+# New shell session: clear any inherited build mode and re-assert the
+# PIP_REQUIRE_VIRTUALENV baseline. Detected by $$ differing from the session
+# PID stored by the parent shell.
 if [[ -o interactive ]]; then
   if [[ "${PYMANAGER_SESSION_PID:-}" != "$$" ]]; then
     if [[ "${PYMANAGER_BUILD_MODE:-}" == "1" ]]; then
       [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager] Clearing inherited build mode for new shell session" >&2
       _PYTHON_BUILD_MODE=0
+      unset PYMANAGER_BUILD_MODE
+      # Legacy save/restore vars from older versions.
+      unset PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
       _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
       _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
-
-      if [[ "${PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET:-0}" == "1" ]]; then
-        export PIP_REQUIRE_VIRTUALENV="${PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV}"
-      else
-        unset PIP_REQUIRE_VIRTUALENV
-      fi
-      unset PYMANAGER_BUILD_MODE PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
     fi
+
+    # A new shell didn't create the parent's wrapper dir and shouldn't try to
+    # reuse it. Drop the bookkeeping; orphan cleanup handles the on-disk dir.
+    _PYMANAGER_LAST_WRAPPER_DIR=""
+    _PYMANAGER_LAST_SET_BIN_DIR=""
 
     export PYMANAGER_SESSION_PID="$$"
   fi
 fi
+
+# Manager baseline: enforce PIP_REQUIRE_VIRTUALENV=1 so pip refuses installs
+# outside virtualenvs, including in subprocesses that don't inherit shell
+# functions. Skipped when the manager is bypassed (CI, non-interactive
+# shells, sandboxes) and while build mode is active.
+if ! _py_manager_should_bypass; then
+    if [[ "${PYMANAGER_BUILD_MODE:-}" != "1" ]] && (( _PYTHON_BUILD_MODE == 0 )); then
+        export PIP_REQUIRE_VIRTUALENV=1
+    fi
+fi
+
+# Register cleanup hook for this shell's wrapper dir. Uses zshexit_functions
+# (append to the array) to avoid clobbering any existing user hooks.
+if [[ -o interactive ]] || [[ -n "${ZSH_NAME:-}" ]]; then
+    autoload -Uz add-zsh-hook 2>/dev/null
+    if typeset -f add-zsh-hook >/dev/null 2>&1; then
+        add-zsh-hook -D zshexit _pymanager_cleanup_current_wrapper 2>/dev/null
+        add-zsh-hook zshexit _pymanager_cleanup_current_wrapper 2>/dev/null
+    else
+        # Fallback if add-zsh-hook isn't available for some reason.
+        typeset -ga zshexit_functions
+        if ! (( ${zshexit_functions[(I)_pymanager_cleanup_current_wrapper]} )); then
+            zshexit_functions+=(_pymanager_cleanup_current_wrapper)
+        fi
+    fi
+fi
+
+# Opportunistic cleanup of orphan wrapper dirs left behind by crashed shells.
+# Cheap: only scans $TMPDIR and /tmp for our naming pattern, then probes the
+# recorded owner PID. Safe to skip failures silently.
+_pymanager_cleanup_orphan_wrappers 2>/dev/null

@@ -117,12 +117,15 @@ Shell wrapper functions intercept `python`, `pip`, etc. and route them appropria
 
 ### Subprocesses (Codex, Claude Code, scripts)
 When you run `setpy <version>`:
-1. Creates symlinks at `~/.local/bin/python` and `~/.local/bin/python3`
-2. Exports `PYTHON` and `PYTHON3` environment variables
-3. Subprocesses find Python via PATH or env vars
+1. Creates a session-scoped wrapper directory under `$TMPDIR` (e.g. `/var/folders/.../T/pymanager.XXXXXXXX/bin/`) containing `python`, `python3`, `python${version}`, `pip`, `pip3`, `pip${version}` — each is a small shell script that execs the chosen interpreter.
+2. Prepends the wrapper directory to `PATH`, followed by the interpreter's real `bin/` directory (so helpers like `python3-config` and installed entry points remain available).
+3. Exports `PYTHON` and `PYTHON3` for tools that look at env vars instead of `PATH`.
+4. Exports `PIP_REQUIRE_VIRTUALENV=1` so even subprocesses that bypass the wrappers cannot install packages outside a venv. Build mode (`--build`) flips this to `0`.
+
+The wrapper directory is cleaned up automatically on shell exit via a `zshexit` hook. Orphaned directories from crashed shells are pruned opportunistically when the manager is sourced.
 
 ### Virtual Environments
-When a venv is active, all commands use the venv's Python/pip automatically.
+When a venv is active, `$VIRTUAL_ENV/bin` is kept ahead of the wrapper directory on `PATH`, so the venv's own `python`/`pip` take precedence automatically.
 
 ## Troubleshooting
 
@@ -150,7 +153,7 @@ setpy clear
 
 ### Codex/Claude Code can't find Python
 ```bash
-# Run setpy to create symlinks (use your preferred version)
+# Run setpy to create the wrapper directory and export PYTHON/PYTHON3
 setpy <version>
 
 # Verify
@@ -177,10 +180,12 @@ The script auto-detects Python installations in:
 
 | Variable | Description |
 |----------|-------------|
-| `PYTHON_MANAGER_FORCE_BYPASS=1` | Disable all wrapper logic |
-| `PYTHON_ALLOW_SYSTEM=1` | Allow system python with setpy override |
+| `PYTHON_MANAGER_FORCE_BYPASS=1` | Disable all wrapper logic (falls through to system commands) |
 | `PYTHON` | Exported by setpy for subprocess compatibility |
 | `PYTHON3` | Exported by setpy for subprocess compatibility |
+| `PIP_REQUIRE_VIRTUALENV=1` | Set by the manager as a baseline; pip refuses installs outside venvs |
+| `PYMANAGER_BUILD_MODE=1` | Set by `setpy --build`; flips `PIP_REQUIRE_VIRTUALENV` to 0 |
+| `PYMANAGER_DEBUG=1` | Enables scanner/debug output on stderr |
 
 ## Uninstall
 
@@ -188,7 +193,10 @@ The script auto-detects Python installations in:
 # Remove from ~/.zshrc (delete the source line)
 # Then:
 rm ~/.config/zsh/pythonmanager.sh
-rm -f ~/.local/bin/python ~/.local/bin/python3  # Remove symlinks
+
+# Wrapper directories clean themselves up on shell exit. Any leftovers
+# from a crashed shell can be removed safely with:
+rm -rf "${TMPDIR:-/tmp}"pymanager.* 2>/dev/null || true
 ```
 
 ## License
