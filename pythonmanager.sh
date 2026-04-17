@@ -2138,6 +2138,39 @@ which() {
     command which "$@"
 }
 
+# Safety net for the common `set 3.14` / `set py3.14` / `set clear` typo
+# where a user means `setpy`. We can't wrap `set` as a function because
+# zsh localizes positional parameters inside functions, which would break
+# `set -- foo bar` and similar legitimate uses.
+#
+# Instead: a preexec hook fires before the user's command, detects the
+# typo pattern in the raw command string, and runs `setpy` for them. The
+# `set` builtin still runs afterward (harmlessly sets $1 to the version
+# string temporarily), but the actual intent — switch the Python default
+# — has already been carried out.
+_pymanager_setpy_typo_guard() {
+    local cmd="$1"
+    # Match:  set <digits>.<digits>...   (e.g. "set 3.14")
+    #         set py<digits>.<digits>... (e.g. "set py3.13")
+    #         set python<digits>.<digits>... (full form)
+    #         set <digits>/<digits>...   (slash typo)
+    #         set clear | set latest | set auto
+    if [[ "$cmd" =~ '^[[:space:]]*set[[:space:]]+((py|python)?[0-9]+[./][0-9]+[^[:space:]]*|clear|latest|auto)[[:space:]]*$' ]]; then
+        local arg="${match[1]}"
+        local normalized="${arg//\//.}"
+        print -u2 -- "[pymanager] 'set' is a zsh builtin (positional params). You probably meant 'setpy ${normalized}' — running that now:"
+        setpy "$normalized"
+    fi
+}
+
+if [[ -o interactive ]] || [[ -n "${ZSH_NAME:-}" ]]; then
+    autoload -Uz add-zsh-hook 2>/dev/null
+    if typeset -f add-zsh-hook >/dev/null 2>&1; then
+        add-zsh-hook -D preexec _pymanager_setpy_typo_guard 2>/dev/null
+        add-zsh-hook preexec _pymanager_setpy_typo_guard 2>/dev/null
+    fi
+fi
+
 (( _PYTHON_MANAGER_READY = 1 ))
 
 
