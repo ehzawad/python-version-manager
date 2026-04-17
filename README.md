@@ -116,12 +116,31 @@ pyinstall upgrade 3.14           # Shortcut: install latest patch for the 3.14 s
 pyinstall verify <tarball>       # Dry-run verification on an already-downloaded tarball
 ```
 
+Install/upgrade flags:
+
+| Flag | Effect |
+|------|--------|
+| `-y`, `--yes` | Skip the confirmation prompt |
+| `-j`, `--jobs N` | `make -j N` (default: detected core count) |
+| `--dry-run` | Print the install plan and exit without downloading or building. Exits nonzero if the real install would fail a precondition (missing deps, clobber without `--force`). |
+| `--force` | Rebuild over an existing prefix by moving it aside to `<prefix>.old-<timestamp>`. Refuses to touch prefixes outside `~/opt/python` without manual action. |
+| `--prefix DIR` | Override install prefix (default `~/opt/python/<version>`). You can also hit `e` at the confirmation prompt to edit the prefix interactively; the plan re-renders with the new path. |
+| `--keep-build` | Keep the build tree after successful install (for inspection) |
+| `--allow-tls-only` | Skip Sigstore / OpenPGP; rely on TLS integrity only. Use with caution. |
+| `--no-sigstore` | Alias for `--allow-tls-only` |
+| `--sigstore-identity EMAIL` | Override the expected Sigstore `--cert-identity`. Use when a new release series hasn't been added to the metadata cache yet. Must be passed with `--sigstore-issuer`. |
+| `--sigstore-issuer URL` | Override the expected Sigstore `--cert-oidc-issuer`. Must be passed with `--sigstore-identity`. |
+
+Before any action `pyinstall` prints a plan view you can sanity-check — source URL, verification method and expected identity, dep status per-item, full `./configure` line with env vars, install prefix, the post-build module check list, and what the shell will do afterwards.
+
 Verification paths:
 
-- **Python 3.14+** — Sigstore (bundle at `Python-X.Y.Z.tgz.sigstore`); the `sigstore` package is installed into a dedicated cached venv at `~/.cache/pymanager/sigstore-venv/` so it never pollutes your system interpreter.
-- **Python 3.13 and older** — OpenPGP (`.asc` signature) against release-manager keys from `keys.openpgp.org`.
+- **Python 3.14+** — Sigstore (`.sigstore` bundle). The expected cert-identity and OIDC issuer are resolved dynamically from [python.org's Sigstore metadata](https://www.python.org/downloads/metadata/sigstore/) (cached for 24h in `~/.cache/pymanager/sigstore-metadata.tsv`). The `sigstore` PyPI package is installed into a dedicated cached venv at `~/.cache/pymanager/sigstore-venv/` (pinned `sigstore>=3.3,<5`, bootstrapped with Python ≥ 3.10) so it never pollutes any system interpreter. If the metadata is unreachable and no cache exists, an embedded fallback table is used; if the fallback also misses your series, pass `--sigstore-identity` + `--sigstore-issuer`.
+- **Python 3.13 and older** — OpenPGP (`.asc` signature) against release-manager fingerprints from `keys.openpgp.org`.
 
-`pyinstall install` calls `pyrefresh` on success so the new interpreter is visible to the current shell immediately.
+Post-build module checks split into required (`ssl hashlib sqlite3 bz2 lzma ctypes _decimal zlib` — install fails on any miss, build tree is kept for inspection) and optional (`readline _gdbm uuid tkinter` — warn only).
+
+When invoked as the `pyinstall` shell function (sourced via `pythonmanager.sh`), `pyrefresh` runs automatically on success so the current shell sees the new interpreter. When run as the script directly (e.g. `./pyinstall.sh install …`), run `pyrefresh` in your interactive shell afterwards.
 
 ## Command Reference
 
@@ -139,8 +158,11 @@ Verification paths:
 | `pywhich <cmd>` | Show what binary would run |
 | `pydiag` | Debug diagnostics |
 | `pyinstall status` | Diff installed self-builds vs upstream latest |
-| `pyinstall install <X.Y.Z>` | Source-build and install a new CPython |
-| `pyinstall upgrade <X.Y>` | Install latest patch of a series |
+| `pyinstall latest [<X.Y>]` | Print upstream-latest patch per supported minor |
+| `pyinstall install <X.Y.Z> [flags]` | Source-build and install a new CPython (see flag table above) |
+| `pyinstall upgrade <X.Y> [flags]` | Install latest patch of a series |
+| `pyinstall verify <tarball>` | Dry-run verification of a local tarball |
+| `pyinstall deps` | Print OS-specific dep install command (does not run it) |
 
 ## How It Works
 
