@@ -4,13 +4,15 @@ A lightweight shell-based Python version manager that enforces explicit Python v
 
 ## Features
 
-- **"Just works" defaults** — on interactive shell init, the latest detected Python is auto-selected as the session default, so `python` / `python3` / `python3.X` all resolve to your preferred interpreter without running `setpy` each time. Set `PYMANAGER_NO_AUTO_SETPY=1` for the original strict behavior (bare `python`/`python3` blocked until explicitly opt-in via `setpy`)
+- **Forces explicit Python versions** — bare `python` and `python3` are **blocked** in a fresh interactive shell. You must either run `setpy <version>` or call an explicit `python3.X`. This is the central invariant of the tool.
 - **Prefers your self-builds** — `~/opt/python/<ver>` beats Homebrew/apt at the same major.minor, even when the package manager ships a newer patch
 - **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, Cursor Agent, sandboxes) refuse too
 - **Build mode** — temporarily allow pip outside a venv for building modules, `setpy <version> --build`
-- **AI-tool compatibility** — session wrapper directory on PATH, cleaned up automatically on shell exit via `zshexit`
+- **Typo guard** — `set 3.14`, `set py3.13`, `set clear` (all common `setpy` typos) auto-route to `setpy` with a one-line hint
+- **Opt-in ergonomic mode** — `export PYMANAGER_AUTO_SETPY=1` (before sourcing) makes every new interactive shell auto-`setpy latest`, so agents see the self-build on PATH without running `setpy` each time
+- **AI-tool compatibility** — when `setpy` is active, a session wrapper directory on PATH routes subprocess `python`/`pip` calls to the chosen interpreter; cleaned up automatically on shell exit via `zshexit`
 - **Virtual environment detection** — venv, conda, poetry, pipenv
-- **Source-build automation** — `pyinstall status / install / upgrade` diffs your local CPython builds against python.org, handles Sigstore (3.14+) or OpenPGP (≤3.13) verification fail-closed, and runs a PGO+LTO build
+- **Source-build automation** — `pyinstall status / install / upgrade` diffs your local CPython builds against python.org, handles Sigstore (3.14+) or OpenPGP (≤3.13) verification fail-closed, and runs a PGO+LTO `make altinstall` build
 
 ## Installation
 
@@ -46,37 +48,45 @@ pyinfo          # Show available Python versions
 ### Basic Commands
 
 ```bash
-# On a fresh interactive shell, the manager auto-picks your latest Python.
-# These all work out of the box (route to the same preferred interpreter):
-python --version              # -> 3.14.4 (or whatever you've got latest)
-python3 --version             # -> 3.14.4
-python3.X --version           # e.g., python3.14, python3.13, python3.12
-python3.X -c "print('hello')"
-py3.X script.py
+# Explicit version always works (this is the default mental model):
+python3.14 --version
+python3.13 -c "print('hello')"
+py3.12 script.py
 
-# pip is still blocked outside a virtual environment by default:
+# Bare python / python3 are BLOCKED in a fresh shell:
+python --version              # Error: No default 'python' command available
+python3 --version             # Same error, with available-versions hint
 pip install requests          # Error: use a virtual environment (or build mode)
 ```
 
-### Override the auto-selected default
-
-`setpy` picks a specific version for this session (useful when you have
-multiple and want something other than latest):
+### Pick a session default
 
 ```bash
-setpy 3.13              # force 3.13 as the default
-python --version        # -> 3.13.13
-setpy                   # Show current status
-setpy clear             # Back to auto-picked latest
+setpy 3.14              # -> python / python3 now route to 3.14
+python --version        # -> Python 3.14.4
+setpy                   # show current status
+setpy clear             # back to strict (bare python blocked)
 ```
 
-To disable auto-setpy entirely (strict mode — bare `python`/`python3`
-blocked until you opt in), add to your `~/.zshrc` **before** sourcing
-`pythonmanager.sh`:
+Typo-friendly: `set 3.14`, `set py3.13`, `set clear` are auto-routed to the
+right `setpy` command (with a one-line hint), since `set` is a zsh builtin
+you almost never actually want when you're thinking about Python versions.
+
+### Opt-in ergonomic mode (auto-setpy)
+
+If you'd rather have the latest detected Python picked automatically in every
+new interactive shell — useful when agent tools (Cursor, Claude Code, Codex
+CLI) spawn non-interactive subshells and you want them to see your
+self-build without running `setpy` each time — add this to `~/.zshrc`
+**before** the `source` line:
 
 ```bash
-export PYMANAGER_NO_AUTO_SETPY=1
+export PYMANAGER_AUTO_SETPY=1
+source ~/.config/zsh/pythonmanager.sh
 ```
+
+The default is off — you need to deliberately opt in. Without the flag,
+bare `python`/`python3` stay blocked until you explicitly run `setpy`.
 
 ### Build Mode (Allow pip)
 
@@ -313,6 +323,8 @@ self-build is behind upstream, and `pyinfo --all` to see all candidates.
 | Variable | Description |
 |----------|-------------|
 | `PYTHON_MANAGER_FORCE_BYPASS=1` | Disable all wrapper logic (falls through to system commands) |
+| `PYMANAGER_AUTO_SETPY=1` | Opt-in: auto-`setpy latest` at each interactive shell init (default: off) |
+| `PYMANAGER_NO_AUTO_SETPY=1` | Legacy back-compat no-op (auto-setpy is off by default now) |
 | `PYTHON` | Exported by setpy for subprocess compatibility |
 | `PYTHON3` | Exported by setpy for subprocess compatibility |
 | `PIP_REQUIRE_VIRTUALENV=1` | Set by the manager as a baseline; pip refuses installs outside venvs |

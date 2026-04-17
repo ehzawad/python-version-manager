@@ -2,13 +2,16 @@
 # Python Version Manager by ehzawad@gmail.com
 #
 # WHAT THIS DOES:
-# - On interactive shell init, auto-picks your latest detected Python as the
-#   session default (auto-setpy). Scanner priority ensures user-built CPythons
-#   under ~/opt/python/<ver>/bin win over Homebrew / apt installs at the same
-#   major.minor. Subprocesses (Cursor Agent, Claude Code, Codex CLI, any
-#   `sh -c …`) inherit PATH and see the preferred interpreter too.
-#   Opt out with `export PYMANAGER_NO_AUTO_SETPY=1` to get strict behavior
-#   (bare `python`/`python3` blocked until you run `setpy <version>`).
+# - Forces explicit Python versions. Bare `python` and `python3` are BLOCKED
+#   in a fresh interactive shell until you run `setpy <version>` or use
+#   explicit `python3.X`. The scanner's priority rule (user-built under
+#   ~/opt/python > Homebrew/apt > system) decides which binary `setpy`
+#   picks when several match at the same major.minor.
+# - Opt-in ergonomic mode for users who want the latest self-build auto-
+#   selected in every new shell: `export PYMANAGER_AUTO_SETPY=1` BEFORE
+#   sourcing this file in your .zshrc. Subprocesses (Cursor Agent, Claude
+#   Code, Codex CLI, sh -c) then inherit a wrapper dir on PATH and see the
+#   preferred interpreter without running setpy explicitly.
 # - Blocks pip outside virtual environments. Enforced two ways:
 #     (a) wrapper functions in interactive shells, which print a helpful error.
 #     (b) PIP_REQUIRE_VIRTUALENV=1 as the manager baseline, which pip itself
@@ -1613,6 +1616,8 @@ pydiag() {
     echo ""
     echo "Environment Variables:"
     echo "  PYTHON_MANAGER_FORCE_BYPASS=${PYTHON_MANAGER_FORCE_BYPASS:-<not set>}"
+    echo "  PYMANAGER_AUTO_SETPY=${PYMANAGER_AUTO_SETPY:-<not set>}   (opt-in; default is strict)"
+    echo "  PYMANAGER_NO_AUTO_SETPY=${PYMANAGER_NO_AUTO_SETPY:-<not set>}   (legacy; no-op when AUTO_SETPY is not 1)"
     echo "  CI=${CI:-<not set>}"
     echo "  CODEX_SANDBOX_NETWORK_DISABLED=${CODEX_SANDBOX_NETWORK_DISABLED:-<not set>}"
     echo "  VIRTUAL_ENV=${VIRTUAL_ENV:-<not set>}"
@@ -2227,22 +2232,27 @@ fi
 # recorded owner PID. Safe to skip failures silently.
 _pymanager_cleanup_orphan_wrappers 2>/dev/null
 
-# === AUTO-SETPY on interactive shell init ===
+# === AUTO-SETPY (opt-in) ===
 #
-# When this file is sourced in a regular interactive shell with a scanned
-# Python available and no override or venv already active, silently pick the
-# latest detected Python as the session default. This creates a wrapper dir
-# that subprocesses (Cursor Agent, Claude Code, Codex CLI, any sh -c …)
-# inherit via PATH, so bare `python`/`python3` resolve to the preferred
-# interpreter there too — not just Homebrew's `python3` from the ambient PATH.
+# Strict is the default: bare `python` and `python3` are BLOCKED in a fresh
+# interactive shell until you run `setpy <version>` or use explicit
+# `python3.X`. This matches the project's central "no default python"
+# invariant from the README.
 #
-# The scanner's own priority rule (user-built under ~/opt/python > Homebrew >
-# system) picks WHICH concrete binary gets wrapped, so on a machine with
-# `pyinstall`-built CPythons they always win over package-manager copies.
+# Users who want the old ergonomic "just works" UX — agents see the
+# self-build via PATH in every fresh shell without running setpy — can
+# opt in by putting this BEFORE sourcing pythonmanager.sh in `.zshrc`:
 #
-# Opt out with `export PYMANAGER_NO_AUTO_SETPY=1` to get the original
-# strict behavior (bare `python`/`python3` blocked until you run `setpy`).
+#   export PYMANAGER_AUTO_SETPY=1
+#
+# When enabled, each new interactive shell picks the latest detected Python
+# as the session default. Scanner priority (user-built under ~/opt/python
+# beats Homebrew/apt/system) decides which concrete binary gets wrapped.
+#
+# PYMANAGER_NO_AUTO_SETPY=1 is still honored as a no-op (back-compat with
+# .zshrc files that set it under the previous ergonomic default).
 if [[ -o interactive ]] && \
+   [[ "${PYMANAGER_AUTO_SETPY:-0}" == "1" ]] && \
    [[ -z "${PYMANAGER_NO_AUTO_SETPY:-}" ]] && \
    ! _py_manager_should_bypass && \
    [[ -z "$_PYTHON_OVERRIDE" ]] && \
