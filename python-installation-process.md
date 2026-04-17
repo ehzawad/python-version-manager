@@ -1,6 +1,8 @@
-Below is a parameterized recipe that follows the **macOS/Homebrew instructions published in the CPython Developer Guide for Python 3.13 and newer**. It installs CPython under `$HOME/opt/python/<version>`, builds it for Apple-silicon only with PGO + LTO, links against Homebrew's OpenSSL 3 and GDBM, and finishes with `make altinstall` so the system- and Homebrew-provided interpreters remain untouched.
+Below is the manual recipe. **Most of the time you should just run `pyinstall install <X.Y.Z>` or `pyinstall upgrade <X.Y>`** (see [README](./README.md#managing-cpython-source-builds-pyinstall)) — it automates every step here, with a pre-flight plan, fail-closed Sigstore/OpenPGP verification, a managed keyring that never pollutes `~/.gnupg`, and post-build module checks. Keep this document for the case where you want to understand what `pyinstall` is doing, or do it by hand.
 
-Set `PYVER` (e.g. `3.13.6`, `3.14.3`) once and the rest of the commands pick it up.
+The recipe follows the **macOS/Homebrew instructions published in the CPython Developer Guide for Python 3.13 and newer**. It installs CPython under `$HOME/opt/python/<version>`, builds for Apple Silicon only with PGO + LTO, links against Homebrew's OpenSSL 3 and GDBM, and finishes with `make altinstall` so the system- and Homebrew-provided interpreters remain untouched.
+
+Set `PYVER` (e.g. `3.13.13`, `3.14.4`) once and the rest of the commands pick it up.
 
 ---
 
@@ -127,6 +129,5 @@ If `--with-openssl` is omitted or its path is wrong, `_ssl` fails to build, and 
 This procedure remains entirely within official CPython guidance and uses only vendor-supplied tool-chains and Homebrew formulae for the few libraries macOS lacks by default.
 
 [1]: https://devguide.python.org/contrib/workflows/install-dependencies/ "Install Dependencies"
-[2]: https://www.python.org/downloads/release/python-3136/ "Python Release Python 3.13.6 | Python.org"
 [3]: https://devguide.python.org/getting-started/setup-building/ "Setup and building"
-[4]: https://docs.python.org/3/using/unix.html "2. Using Python on Unix platforms — Python 3.13.6 documentation"
+[4]: https://docs.python.org/3/using/unix.html "Using Python on Unix platforms"

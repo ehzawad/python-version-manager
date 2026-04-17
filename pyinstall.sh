@@ -313,6 +313,11 @@ _ensure_sigstore_venv() {
         fi
         _warn "Existing sigstore venv doesn't respond to 'verify identity'; recreating"
         rm -rf "$_PYINSTALL_SIGSTORE_VENV"
+    elif [[ -d "${_PYINSTALL_SIGSTORE_VENV}" ]]; then
+        # Directory exists but bin/python is missing or a dangling symlink —
+        # typically the bootstrap Python the venv was built against got removed.
+        _warn "Existing sigstore venv has a broken interpreter link; recreating"
+        rm -rf "$_PYINSTALL_SIGSTORE_VENV"
     fi
 
     # Sigstore 3.3+ requires Python >= 3.10.

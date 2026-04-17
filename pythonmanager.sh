@@ -2,24 +2,37 @@
 # Python Version Manager by ehzawad@gmail.com
 #
 # WHAT THIS DOES:
-# - Forces explicit Python versions (python3.X) - no default python/python3
-# - Blocks pip outside virtual environments
-# - Auto-detects venvs and exports VIRTUAL_ENV for subprocesses
-# - Temporary version override with 'setpy <version>'
-# - Build mode for pip access with 'setpy <version> --build'
-#   (Build mode auto-clears in new shell sessions)
+# - Forces explicit Python versions (python3.X); bare `python`/`python3` is
+#   blocked unless a temporary override is set via `setpy <version>`.
+# - Blocks pip outside virtual environments. Enforced two ways:
+#     (a) wrapper functions in interactive shells, which print a helpful error.
+#     (b) PIP_REQUIRE_VIRTUALENV=1 as the manager baseline, which pip itself
+#         respects — so subprocesses without the wrapper functions also refuse.
+# - Scanner prefers user-built CPythons under ~/opt/python/<ver>/bin over
+#   Homebrew/apt installs of the same major.minor, even when the package
+#   manager ships a newer patch. See `pyinfo --all` for the ladder.
+# - `setpy <version> [--build]` — temporary default. --build allows pip
+#   outside a venv (auto-clears in new shell sessions).
+# - `pyinstall` — source-build manager. Checks python.org, diffs against
+#   ~/opt/python, offers `install <X.Y.Z>` / `upgrade <X.Y>` with Sigstore
+#   (3.14+) or OpenPGP (≤3.13) fail-closed verification.
+# - `pyrefresh` — rescan after a manual install.
+# - `pyinfo [--all]` — show selected Python per major.minor (and shadowed
+#   candidates with --all).
 #
 # LIMITATIONS (Fundamental OS restrictions):
-# - Wrapper functions ONLY work in interactive shells where you type commands
-# - Subprocesses/sandboxes inherit ENVIRONMENT VARIABLES but NOT shell functions
-# - When Claude Code/Codex spawn subshells, they get exported vars (VIRTUAL_ENV, PATH)
-#   but NOT the wrapper functions - this is normal Unix behavior
+# - Wrapper functions ONLY work in interactive shells where you type commands.
+# - Subprocesses/sandboxes inherit ENVIRONMENT VARIABLES but NOT shell
+#   functions. They get exported vars (PATH, PYTHON, PIP_REQUIRE_VIRTUALENV,
+#   etc.) plus the session wrapper directory on PATH (python/python3/pip/…
+#   shell scripts), but not the interactive wrapper functions.
 #
 # SANDBOXED ENVIRONMENT SUPPORT:
-# Auto-detects when helper functions aren't loaded and safely falls back to system commands.
-# Bypass triggers: non-interactive shells, CI=1, CODEX_SANDBOX_NETWORK_DISABLED=1
-# Manual bypass: export PYTHON_MANAGER_FORCE_BYPASS=1
-# Diagnostics: Run 'pydiag'
+# Auto-detects when helper functions aren't loaded and safely falls back to
+# system commands.
+# Bypass triggers: non-interactive shells, CI=1, CODEX_SANDBOX_NETWORK_DISABLED=1.
+# Manual bypass: export PYTHON_MANAGER_FORCE_BYPASS=1.
+# Diagnostics: Run 'pydiag'.
 #
 # Global variables
 #

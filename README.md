@@ -4,11 +4,13 @@ A lightweight shell-based Python version manager that enforces explicit Python v
 
 ## Features
 
-- **Forces explicit Python versions** - No default `python` or `python3` (use `python3.X` explicitly)
-- **Blocks pip outside virtual environments** - Prevents polluting system packages
-- **Build mode** - Temporarily allow pip for building modules with `setpy <version> --build`
-- **AI tool compatibility** - Works with Codex CLI, Claude Code, Cursor via symlinks + env vars
-- **Virtual environment detection** - Auto-detects venv, conda, poetry, pipenv
+- **Forces explicit Python versions** — No default `python` or `python3` (use `python3.X` explicitly)
+- **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, sandboxes) refuse too
+- **Prefers your self-builds** — `~/opt/python/<ver>` beats Homebrew/apt at the same major.minor, even when the package manager ships a newer patch
+- **Build mode** — temporarily allow pip outside a venv for building modules, `setpy <version> --build`
+- **AI-tool compatibility** — session wrapper directory on PATH, cleaned up automatically on shell exit via `zshexit`
+- **Virtual environment detection** — venv, conda, poetry, pipenv
+- **Source-build automation** — `pyinstall status / install / upgrade` diffs your local CPython builds against python.org, handles Sigstore (3.14+) or OpenPGP (≤3.13) verification fail-closed, and runs a PGO+LTO build
 
 ## Installation
 
@@ -133,10 +135,10 @@ Install/upgrade flags:
 
 Before any action `pyinstall` prints a plan view you can sanity-check — source URL, verification method and expected identity, dep status per-item, full `./configure` line with env vars, install prefix, the post-build module check list, and what the shell will do afterwards.
 
-Verification paths:
+Verification paths (both fail-closed — install aborts on verification failure unless `--allow-tls-only` is explicitly passed):
 
 - **Python 3.14+** — Sigstore (`.sigstore` bundle). The expected cert-identity and OIDC issuer are resolved dynamically from [python.org's Sigstore metadata](https://www.python.org/downloads/metadata/sigstore/) (cached for 24h in `~/.cache/pymanager/sigstore-metadata.tsv`). The `sigstore` PyPI package is installed into a dedicated cached venv at `~/.cache/pymanager/sigstore-venv/` (pinned `sigstore>=3.3,<5`, bootstrapped with Python ≥ 3.10) so it never pollutes any system interpreter. If the metadata is unreachable and no cache exists, an embedded fallback table is used; if the fallback also misses your series, pass `--sigstore-identity` + `--sigstore-issuer`.
-- **Python 3.13 and older** — OpenPGP (`.asc` signature) against release-manager fingerprints from `keys.openpgp.org`.
+- **Python 3.13 and older** — OpenPGP (`.asc` signature). Per-minor signer map (Thomas Wouters for 3.12/3.13, Pablo Galindo for 3.10/3.11, Łukasz Langa for 3.8/3.9, Ned Deily for 3.7) — keys fetched from their pinned per-signer URL first (e.g. `github.com/Yhg1s.gpg`), falling back to `keys.openpgp.org`. Keys are imported into a managed keyring at `~/.cache/pymanager/gnupg` (mode 700) so pyinstall never pollutes your real GPG keyring. Verification uses `gpg --status-fd 1 --verify` and asserts a `VALIDSIG <full-40-char-fingerprint>` line — plain exit 0 is not accepted.
 
 Post-build module checks split into required (`ssl hashlib sqlite3 bz2 lzma ctypes _decimal zlib` — install fails on any miss, build tree is kept for inspection) and optional (`readline _gdbm uuid tkinter` — warn only).
 
@@ -240,12 +242,13 @@ one with the highest priority:
 | Priority | Location |
 |----------|----------|
 | 100 | `~/.local/bin` |
-| 90 | `~/opt/python/<version>/bin` (user self-build) |
-| 80 | `/opt/python/<version>/bin` (admin self-build) |
-| 70 | `~/.pythons/*/bin` |
-| 50 | `/opt/homebrew/...`, `/usr/local/opt/python@*/bin` (package manager) |
-| 40 | `~/bin`, `~/Library/Python/*/bin`, other |
-| 10 | `/usr/bin` (system) |
+| 90  | `~/opt/python/<version>/bin` (user self-build) |
+| 80  | `/opt/python/<version>/bin` (admin self-build) |
+| 70  | `~/.pythons/*/bin` |
+| 50  | `/opt/homebrew/...`, `/usr/local/opt/python@*/bin` (package manager) |
+| 40  | `~/bin`, `~/Library/Python/*/bin`, other |
+| 10  | `/usr/bin` (system) |
+| 5   | `~/opt/python/<ver>.old-<timestamp>/bin` (leftover from `pyinstall --force`) |
 
 Within the same priority level, the higher patch version wins as a tiebreaker.
 This means a deliberate `make altinstall` under `~/opt/python/` will **not** be
@@ -269,11 +272,14 @@ self-build is behind upstream, and `pyinfo --all` to see all candidates.
 ```bash
 # Remove from ~/.zshrc (delete the source line)
 # Then:
-rm ~/.config/zsh/pythonmanager.sh
+rm ~/.config/zsh/pythonmanager.sh ~/.config/zsh/pyinstall.sh
 
 # Wrapper directories clean themselves up on shell exit. Any leftovers
 # from a crashed shell can be removed safely with:
 rm -rf "${TMPDIR:-/tmp}"pymanager.* 2>/dev/null || true
+
+# pyinstall caches (downloads, build tree, managed GPG/Sigstore keyrings):
+rm -rf ~/.cache/pymanager
 ```
 
 ## License
