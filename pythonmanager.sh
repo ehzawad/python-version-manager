@@ -68,9 +68,6 @@ typeset -g _PYTHON_OVERRIDE
 typeset -gi _PYTHON_BUILD_MODE
 typeset -g _PYMANAGER_LAST_SET_BIN_DIR
 typeset -g _PYMANAGER_LAST_WRAPPER_DIR
-# Legacy; retained for downward compat with shells that sourced an older version.
-typeset -gi _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET
-typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
 
 # === EARLY PATH SETUP (runs on source, before functions are defined) ===
 # This ensures login shells get correct PATH even without full function loading.
@@ -1032,9 +1029,8 @@ setpy() {
                 # remains in effect until the shell exits.
                 export PIP_REQUIRE_VIRTUALENV=1
                 unset PYMANAGER_BUILD_MODE
-                # Legacy saved-value vars from older versions; safe to clear.
-                _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
-                _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
+                # Legacy exported save/restore env from pre-baseline versions
+                # — unset in case an older shell session exported them.
                 unset PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
             fi
         else
@@ -1104,7 +1100,10 @@ setpy() {
 
     local python_path="${_PYTHON_PATHS[$version]}"
 
-    # Prefer a real interpreter path for exports/symlinks (avoid self-referential symlink loops)
+    # Resolve to the real interpreter path before exporting PYTHON / building
+    # wrappers. The stored path can be a symlink chain (e.g. Homebrew's
+    # python3 -> ../Cellar/.../python3.14); following it keeps us pointing
+    # to a stable target even if the symlink later changes.
     local python_target="$python_path"
     if [[ -L "$python_target" ]]; then
         local count=0
@@ -1556,9 +1555,13 @@ _pip_version_wrapper() {
     return 1
 }
 
-# Create version functions for a wide range (covers current and future Python versions)
-# Note: The wrapper functions handle non-existent versions gracefully with helpful error messages
-# This range (3.8-3.25) should cover Python releases for many years to come
+# Create python3.X / pip3.X / py3.X wrapper functions across a wide range of
+# Python 3 minors — both legacy (3.8, 3.9) that a user may still have installed
+# externally, and ahead-of-time (3.20+) so new releases are automatically
+# governed by the manager. The wrapper functions handle non-existent versions
+# gracefully by falling back to `command pythonX.Y` which emits a clear
+# "not found" error. Bump the upper bound when Python's release cadence
+# actually catches up.
 for major in 3; do
     for minor in {8..25}; do
         ver="${major}.${minor}"
@@ -2118,10 +2121,8 @@ if [[ -o interactive ]]; then
       [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager] Clearing inherited build mode for new shell session" >&2
       _PYTHON_BUILD_MODE=0
       unset PYMANAGER_BUILD_MODE
-      # Legacy save/restore vars from older versions.
+      # Legacy exported save/restore env from pre-baseline versions.
       unset PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
-      _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
-      _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
     fi
 
     # A new shell didn't create the parent's wrapper dir and shouldn't try to

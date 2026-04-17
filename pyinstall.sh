@@ -161,15 +161,15 @@ _local_installs() {
 
 # Embedded fallback in case the metadata page is unreachable and no cache exists.
 # From https://www.python.org/downloads/metadata/sigstore/ — last synced 2026-04-17.
-# Three distinct OIDC issuers in active use:
+# Covers the series that are currently supported (status bugfix/security per
+# PEP release-cycle) plus the two planned future series. EOL series (3.9 and
+# earlier) are intentionally omitted — pyinstall status won't surface them,
+# and the network path remains as a last resort if one is ever needed.
+# Two distinct OIDC issuers in active use:
 #   accounts.google.com          — Pablo Galindo, Thomas Wouters (3.10-3.13)
-#   github.com/login/oauth       — interactive OAuth for Hugo, Savannah, Nad, Łukasz
-#   token.actions.githubusercontent.com — GitHub Actions CI (not currently used)
+#   github.com/login/oauth       — interactive OAuth for Hugo, Savannah
 _sigstore_embedded_fallback() {
     cat <<'FALLBACK'
-3.7	nad@python.org	https://github.com/login/oauth
-3.8	lukasz@langa.pl	https://github.com/login/oauth
-3.9	lukasz@langa.pl	https://github.com/login/oauth
 3.10	pablogsal@python.org	https://accounts.google.com
 3.11	pablogsal@python.org	https://accounts.google.com
 3.12	thomas@python.org	https://accounts.google.com
@@ -413,7 +413,8 @@ _ensure_gnupg_home() {
 
 # Per-minor signer map, sourced from https://www.python.org/downloads/metadata/pgp/.
 # Each call prints "<name>\t<email>\t<fingerprint>\t<key_url>".
-# If the minor has no mapping (e.g. 3.14+ which is Sigstore-only), returns 1.
+# Returns 1 if the minor has no mapping — happens for 3.14+ (Sigstore-only)
+# and for EOL series we intentionally don't support here.
 # Fingerprints are full 40-char SHA-1; short key IDs are insecure for pinning.
 _gpg_signer_for() {
     local minor="$1"
@@ -426,14 +427,6 @@ _gpg_signer_for() {
         3.10|3.11)
             # Pablo Galindo Salgado — keybase link from python.org PGP page.
             print -- "Pablo Galindo Salgado\tpablogsal@python.org\tA035C8C19219BA821ECEA86B64E628F8D684696D\thttps://keybase.io/pablogsal/pgp_keys.asc"
-            ;;
-        3.8|3.9)
-            # Łukasz Langa — keybase link from python.org PGP page.
-            print -- "Łukasz Langa\tlukasz@langa.pl\tE3FF2839C048B25C084DEBE9B26995E310250568\thttps://keybase.io/ambv/pgp_keys.asc"
-            ;;
-        3.7)
-            # Ned Deily — macOS-binaries key (the one that signed 3.7.x source).
-            print -- "Ned Deily\tnad@python.org\tC9B104B3DD3AA72D7CCB1066FB9921286F5E1540\thttps://keybase.io/nad/pgp_keys.asc"
             ;;
         *)
             return 1
@@ -1095,6 +1088,7 @@ _cmd_install() {
 
     if (( dry_run )); then
         # Exit nonzero if the install would fail at preconditions; otherwise 0.
+        # Match the preconditions the real install flow enforces.
         if (( ${#_PYINSTALL_DEPS_MISSING} )); then
             _err "dry-run: would fail — missing dependencies"
             return 1
@@ -1102,6 +1096,31 @@ _cmd_install() {
         if _install_would_clobber "$prefix" "$version" "$force"; then
             _err "dry-run: would fail — prefix exists"
             return 1
+        fi
+        # Verification preconditions — mirror _verify_tarball's policy.
+        if (( ! allow_tls_only )); then
+            local dry_mm="${version%.*}"
+            local dry_minor="${dry_mm#*.}"
+            if (( dry_minor >= 14 )); then
+                if [[ -z "$sigstore_identity" ]] || [[ -z "$sigstore_issuer" ]]; then
+                    if ! _sigstore_identity_for "$dry_mm" >/dev/null 2>&1; then
+                        _err "dry-run: would fail — no Sigstore identity mapping for Python $dry_mm"
+                        _err "Pass --sigstore-identity and --sigstore-issuer, or --allow-tls-only to bypass."
+                        return 1
+                    fi
+                fi
+            else
+                if ! command -v gpg >/dev/null 2>&1; then
+                    _err "dry-run: would fail — gpg is not installed and Python $dry_mm requires OpenPGP"
+                    _err "Install gpg or pass --allow-tls-only to bypass."
+                    return 1
+                fi
+                if ! _gpg_signer_for "$dry_mm" >/dev/null 2>&1; then
+                    _err "dry-run: would fail — no OpenPGP signer mapping for Python $dry_mm"
+                    _err "Pass --allow-tls-only to bypass, or install a currently-supported series."
+                    return 1
+                fi
+            fi
         fi
         _log "dry-run: plan is executable"
         return 0

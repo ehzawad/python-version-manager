@@ -47,7 +47,7 @@ pyinfo          # Show available Python versions
 
 ```bash
 # Use specific Python version (always works)
-python3.X --version           # e.g., python3.14, python3.12, python3.9
+python3.X --version           # e.g., python3.14, python3.13, python3.12
 python3.X -c "print('hello')"
 py3.X script.py
 
@@ -138,7 +138,7 @@ Before any action `pyinstall` prints a plan view you can sanity-check — source
 Verification paths (both fail-closed — install aborts on verification failure unless `--allow-tls-only` is explicitly passed):
 
 - **Python 3.14+** — Sigstore (`.sigstore` bundle). The expected cert-identity and OIDC issuer are resolved dynamically from [python.org's Sigstore metadata](https://www.python.org/downloads/metadata/sigstore/) (cached for 24h in `~/.cache/pymanager/sigstore-metadata.tsv`). The `sigstore` PyPI package is installed into a dedicated cached venv at `~/.cache/pymanager/sigstore-venv/` (pinned `sigstore>=3.3,<5`, bootstrapped with Python ≥ 3.10) so it never pollutes any system interpreter. If the metadata is unreachable and no cache exists, an embedded fallback table is used; if the fallback also misses your series, pass `--sigstore-identity` + `--sigstore-issuer`.
-- **Python 3.13 and older** — OpenPGP (`.asc` signature). Per-minor signer map (Thomas Wouters for 3.12/3.13, Pablo Galindo for 3.10/3.11, Łukasz Langa for 3.8/3.9, Ned Deily for 3.7) — keys fetched from their pinned per-signer URL first (e.g. `github.com/Yhg1s.gpg`), falling back to `keys.openpgp.org`. Keys are imported into a managed keyring at `~/.cache/pymanager/gnupg` (mode 700) so pyinstall never pollutes your real GPG keyring. Verification uses `gpg --status-fd 1 --verify` and asserts a `VALIDSIG <full-40-char-fingerprint>` line — plain exit 0 is not accepted.
+- **Python 3.13 and older** — OpenPGP (`.asc` signature). Per-minor signer map for currently-supported series: Thomas Wouters for 3.12/3.13, Pablo Galindo for 3.10/3.11. Keys fetched from their pinned per-signer URL first (e.g. `github.com/Yhg1s.gpg`), falling back to `keys.openpgp.org`. Keys are imported into a managed keyring at `~/.cache/pymanager/gnupg` (mode 700) so pyinstall never pollutes your real GPG keyring. Verification uses `gpg --status-fd 1 --verify` and asserts a `VALIDSIG <full-40-char-fingerprint>` line — plain exit 0 is not accepted. EOL series (3.9 and earlier) aren't in the map; pass `--allow-tls-only` if you need to force-install one.
 
 Post-build module checks split into required (`ssl hashlib sqlite3 bz2 lzma ctypes _decimal zlib` — install fails on any miss, build tree is kept for inspection) and optional (`readline _gdbm uuid tkinter` — warn only).
 

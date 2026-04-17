@@ -70,8 +70,8 @@ curl -fsSL https://github.com/Yhg1s.gpg | gpg --import
 gpg --verify "Python-${PYVER}.tgz.asc" "Python-${PYVER}.tgz"
 # For 3.10.x / 3.11.x use Pablo Galindo's key
 # (A035C8C19219BA821ECEA86B64E628F8D684696D, https://keybase.io/pablogsal/pgp_keys.asc).
-# For 3.8.x / 3.9.x use Łukasz Langa's key
-# (E3FF2839C048B25C084DEBE9B26995E310250568, https://keybase.io/ambv/pgp_keys.asc).
+# 3.9.x and earlier are EOL; keys for their historical release managers are
+# listed on the python.org PGP metadata page for reference.
 ```
 
 #### Then extract
