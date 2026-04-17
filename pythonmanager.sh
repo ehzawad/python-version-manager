@@ -2,17 +2,19 @@
 # Python Version Manager by ehzawad@gmail.com
 #
 # WHAT THIS DOES:
-# - Forces explicit Python versions (python3.X); bare `python`/`python3` is
-#   blocked unless a temporary override is set via `setpy <version>`.
+# - On interactive shell init, auto-picks your latest detected Python as the
+#   session default (auto-setpy). Scanner priority ensures user-built CPythons
+#   under ~/opt/python/<ver>/bin win over Homebrew / apt installs at the same
+#   major.minor. Subprocesses (Cursor Agent, Claude Code, Codex CLI, any
+#   `sh -c …`) inherit PATH and see the preferred interpreter too.
+#   Opt out with `export PYMANAGER_NO_AUTO_SETPY=1` to get strict behavior
+#   (bare `python`/`python3` blocked until you run `setpy <version>`).
 # - Blocks pip outside virtual environments. Enforced two ways:
 #     (a) wrapper functions in interactive shells, which print a helpful error.
 #     (b) PIP_REQUIRE_VIRTUALENV=1 as the manager baseline, which pip itself
 #         respects — so subprocesses without the wrapper functions also refuse.
-# - Scanner prefers user-built CPythons under ~/opt/python/<ver>/bin over
-#   Homebrew/apt installs of the same major.minor, even when the package
-#   manager ships a newer patch. See `pyinfo --all` for the ladder.
-# - `setpy <version> [--build]` — temporary default. --build allows pip
-#   outside a venv (auto-clears in new shell sessions).
+# - `setpy <version> [--build]` — explicit temporary default (overrides the
+#   auto-pick). --build allows pip outside a venv; auto-clears in new shells.
 # - `pyinstall` — source-build manager. Checks python.org, diffs against
 #   ~/opt/python, offers `install <X.Y.Z>` / `upgrade <X.Y>` with Sigstore
 #   (3.14+) or OpenPGP (≤3.13) fail-closed verification.
@@ -2191,3 +2193,29 @@ fi
 # Cheap: only scans $TMPDIR and /tmp for our naming pattern, then probes the
 # recorded owner PID. Safe to skip failures silently.
 _pymanager_cleanup_orphan_wrappers 2>/dev/null
+
+# === AUTO-SETPY on interactive shell init ===
+#
+# When this file is sourced in a regular interactive shell with a scanned
+# Python available and no override or venv already active, silently pick the
+# latest detected Python as the session default. This creates a wrapper dir
+# that subprocesses (Cursor Agent, Claude Code, Codex CLI, any sh -c …)
+# inherit via PATH, so bare `python`/`python3` resolve to the preferred
+# interpreter there too — not just Homebrew's `python3` from the ambient PATH.
+#
+# The scanner's own priority rule (user-built under ~/opt/python > Homebrew >
+# system) picks WHICH concrete binary gets wrapped, so on a machine with
+# `pyinstall`-built CPythons they always win over package-manager copies.
+#
+# Opt out with `export PYMANAGER_NO_AUTO_SETPY=1` to get the original
+# strict behavior (bare `python`/`python3` blocked until you run `setpy`).
+if [[ -o interactive ]] && \
+   [[ -z "${PYMANAGER_NO_AUTO_SETPY:-}" ]] && \
+   ! _py_manager_should_bypass && \
+   [[ -z "$_PYTHON_OVERRIDE" ]] && \
+   ! _in_virtual_env; then
+    _scan_all_pythons
+    if (( ${#_PYTHON_VERSIONS} > 0 )); then
+        setpy latest --quiet 2>/dev/null || true
+    fi
+fi

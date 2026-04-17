@@ -4,9 +4,9 @@ A lightweight shell-based Python version manager that enforces explicit Python v
 
 ## Features
 
-- **Forces explicit Python versions** — No default `python` or `python3` (use `python3.X` explicitly)
-- **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, sandboxes) refuse too
+- **"Just works" defaults** — on interactive shell init, the latest detected Python is auto-selected as the session default, so `python` / `python3` / `python3.X` all resolve to your preferred interpreter without running `setpy` each time. Set `PYMANAGER_NO_AUTO_SETPY=1` for the original strict behavior (bare `python`/`python3` blocked until explicitly opt-in via `setpy`)
 - **Prefers your self-builds** — `~/opt/python/<ver>` beats Homebrew/apt at the same major.minor, even when the package manager ships a newer patch
+- **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, Cursor Agent, sandboxes) refuse too
 - **Build mode** — temporarily allow pip outside a venv for building modules, `setpy <version> --build`
 - **AI-tool compatibility** — session wrapper directory on PATH, cleaned up automatically on shell exit via `zshexit`
 - **Virtual environment detection** — venv, conda, poetry, pipenv
@@ -46,23 +46,36 @@ pyinfo          # Show available Python versions
 ### Basic Commands
 
 ```bash
-# Use specific Python version (always works)
+# On a fresh interactive shell, the manager auto-picks your latest Python.
+# These all work out of the box (route to the same preferred interpreter):
+python --version              # -> 3.14.4 (or whatever you've got latest)
+python3 --version             # -> 3.14.4
 python3.X --version           # e.g., python3.14, python3.13, python3.12
 python3.X -c "print('hello')"
 py3.X script.py
 
-# These are BLOCKED by default (no default python)
-python --version        # Error: use explicit version
-pip install requests    # Error: use virtual environment
+# pip is still blocked outside a virtual environment by default:
+pip install requests          # Error: use a virtual environment (or build mode)
 ```
 
-### Set Temporary Python Default
+### Override the auto-selected default
+
+`setpy` picks a specific version for this session (useful when you have
+multiple and want something other than latest):
 
 ```bash
-setpy <version>         # e.g., setpy 3.14 - sets python/python3
-python --version        # Now works with the set version
+setpy 3.13              # force 3.13 as the default
+python --version        # -> 3.13.13
 setpy                   # Show current status
-setpy clear             # Remove the override
+setpy clear             # Back to auto-picked latest
+```
+
+To disable auto-setpy entirely (strict mode — bare `python`/`python3`
+blocked until you opt in), add to your `~/.zshrc` **before** sourcing
+`pythonmanager.sh`:
+
+```bash
+export PYMANAGER_NO_AUTO_SETPY=1
 ```
 
 ### Build Mode (Allow pip)
