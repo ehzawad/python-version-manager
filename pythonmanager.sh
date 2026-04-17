@@ -168,6 +168,12 @@ _pymanager_candidate_priority() {
     local dir="${py:h}"
     # Patterns are matched left-to-right; more specific patterns appear first.
     case "$dir" in
+        # --force rebuild backups: ~/opt/python/<ver>.old-<timestamp>/bin.
+        # They share the same priority class as live self-builds, so demote
+        # them below /usr/bin so they never beat a legit install on patch
+        # tiebreak when the glob expands `.old-*` before the fresh dir.
+        "$HOME/opt/python/"*".old-"*"/bin"|"/opt/python/"*".old-"*"/bin")
+            print 5 ;;
         "$HOME/.local/bin")
             print 100 ;;
         "$HOME/opt/python/"*"/bin"|"$HOME/opt/python"*"/bin")
