@@ -207,7 +207,8 @@ pip install package
 setpy clear
 ```
 
-### Codex/Claude Code can't find Python
+### Codex/Claude Code/Cursor Agent can't find Python
+
 ```bash
 # Run setpy to create the wrapper directory and export PYTHON/PYTHON3
 setpy <version>
@@ -216,7 +217,45 @@ setpy <version>
 pydiag | grep -A5 "Subprocess"
 ```
 
+### `python3` resolves to Homebrew but `python` resolves to your self-build
+
+Symptom (most often in Cursor Agent's subshell):
+
+```zsh
+python3 -c "import sys; print(sys.executable)"
+# /opt/homebrew/opt/python@3.14/bin/python3.14   ← Homebrew
+
+python -c "import sys; print(sys.executable)"
+# /Users/ehz/opt/python/3.14.4/bin/python3.14    ← self-build (via pymanager)
+```
+
+Cause: Homebrew's `/opt/homebrew/bin/` ships `python3` (and `python3.14`) but
+**no bare `python`**. If the agent's subshell has `/opt/homebrew/bin` ahead of
+the pymanager wrapper on `PATH`, `python3` is matched by Homebrew first;
+`python` falls through to the wrapper. Claude Code and Codex CLI typically
+have the wrapper ahead of Homebrew and see the self-build for both.
+
+The manager's early PATH-repair block auto-corrects this when it detects an
+inherited wrapper not at the expected front position. It runs every time
+`pythonmanager.sh` is sourced (i.e. every `.zshrc`-loading shell). If you
+still see the split:
+
+```zsh
+# Diagnostic — avoid `which` here because this project wraps it
+print -r -- "cursor=${CURSOR_AGENT:-no}"
+print -r -- "_PYMANAGER_PATH_INIT=${_PYMANAGER_PATH_INIT:-unset}"
+print -rl -- ${(ps.:.)PATH} | nl -ba | head -20
+whence -p python
+whence -p python3
+```
+
+If PATH shows Homebrew before the `pymanager.*/bin` entry, either the shell
+isn't sourcing `.zshrc` (run `zsh -i -c 'echo hi'` to confirm it's interactive)
+or the wrapper dir isn't in PATH at all — run `setpy <version>` inside that
+shell to recreate it.
+
 ### Check if ~/.local/bin is in PATH
+
 ```bash
 echo $PATH | tr ':' '\n' | head -5
 # ~/.local/bin should be first or near the top

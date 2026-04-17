@@ -70,74 +70,70 @@ typeset -g _PYMANAGER_LAST_SET_BIN_DIR
 typeset -g _PYMANAGER_LAST_WRAPPER_DIR
 
 # === EARLY PATH SETUP (runs on source, before functions are defined) ===
-# This ensures login shells get correct PATH even without full function loading.
-# Idempotent: safe to source multiple times.
+# Runs on every source. Ensures login shells get correct PATH ordering even
+# without full function loading. Idempotent: safe to source multiple times.
 #
-# IMPORTANT: We must run this setup if:
-#   1. First time sourcing (_PYMANAGER_PATH_INIT not set), OR
-#   2. VIRTUAL_ENV is set but its bin is NOT at the FRONT of PATH
-#   3. CONDA_PREFIX is set but its bin is NOT at the FRONT of PATH
+# Repair is triggered if any of these are true:
+#   1. First time sourcing (_PYMANAGER_PATH_INIT not yet set)
+#   2. A pymanager wrapper dir exists in PATH but isn't at the expected front
+#      position (this is the Cursor-Agent-style case: parent shell ran setpy,
+#      but a later init — e.g. Homebrew shellenv — pushed /opt/homebrew/bin
+#      ahead of the wrapper, so python3 resolves to Homebrew instead)
+#   3. VIRTUAL_ENV or CONDA_PREFIX is active but its bin isn't at the front
 #
-# This fixes the bug where Codex/cursor-agent spawn subshells that inherit
-# _PYMANAGER_PATH_INIT but have wrong PATH ordering (venv bin after /usr/bin).
+# Wrapper pattern matches both new (pymanager.XXXXXXXX from mktemp) and legacy
+# (pymanager-<pid>) schemes so inherited wrappers from older versions still
+# work during transition.
 {
   local _pymanager_needs_path_fix=0
 
-  # Check if we need to run the path setup
+  # Find any existing pymanager wrapper in PATH. Reused by the repair block
+  # below so we don't rediscover it.
+  local _pymanager_existing_wrapper=""
+  local _pymanager_existing_wrapper_idx=0
+  local _pm_dir _pm_i=0
+  for _pm_dir in $path; do
+    _pm_i=$(( _pm_i + 1 ))
+    if [[ "$_pm_dir" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]]; then
+      _pymanager_existing_wrapper="$_pm_dir"
+      _pymanager_existing_wrapper_idx=$_pm_i
+      break
+    fi
+  done
+
+  # Decide if repair is needed.
+  local _first_path="${PATH%%:*}"
+  local _second_path=""
+  local _rest="${PATH#*:}"
+  [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
+
   if [[ -z "${_PYMANAGER_PATH_INIT:-}" ]]; then
     _pymanager_needs_path_fix=1
+  elif [[ -n "$_pymanager_existing_wrapper" ]]; then
+    # Wrapper exists. It should be at position 1, OR position 2 if venv/conda
+    # is at position 1. Anything else is a drifted PATH we need to repair.
+    if [[ "$_first_path" == "$_pymanager_existing_wrapper" ]]; then
+      : # OK - wrapper first
+    elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]] && \
+         [[ "$_first_path" == "$VIRTUAL_ENV/bin" ]] && \
+         [[ "$_second_path" == "$_pymanager_existing_wrapper" ]]; then
+      : # OK - venv first, wrapper second
+    elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]] && \
+         [[ "$_first_path" == "$CONDA_PREFIX/bin" ]] && \
+         [[ "$_second_path" == "$_pymanager_existing_wrapper" ]]; then
+      : # OK - conda first, wrapper second
+    else
+      _pymanager_needs_path_fix=1
+    fi
   elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
-    # VIRTUAL_ENV is set - check if its bin is at the FRONT of PATH (not just present)
-    # This catches the case where subshells inherit _PYMANAGER_PATH_INIT but have
-    # wrong PATH ordering (e.g., /usr/bin before venv bin)
-    local _first_path="${PATH%%:*}"
-    local _second_path=""
-    local _rest="${PATH#*:}"
-    [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
-
-    # Venv bin should be first, OR second if a pymanager wrapper is first.
-    # Wrapper dir pattern matches both new (pymanager.XXXXXXXX from mktemp) and
-    # legacy (pymanager-<pid>) schemes so inherited wrappers from parent shells
-    # running older versions are still recognized during transition.
-    if [[ "$_first_path" == "$VIRTUAL_ENV/bin" ]]; then
-      : # OK - venv is first
-    elif [[ "$_first_path" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]] && \
-         [[ "$_second_path" == "$VIRTUAL_ENV/bin" ]]; then
-      : # OK - pymanager wrapper first, venv second
-    else
-      _pymanager_needs_path_fix=1
-    fi
+    [[ "$_first_path" == "$VIRTUAL_ENV/bin" ]] || _pymanager_needs_path_fix=1
   elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
-    # CONDA_PREFIX is set - same logic as VIRTUAL_ENV
-    local _first_path="${PATH%%:*}"
-    local _second_path=""
-    local _rest="${PATH#*:}"
-    [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
-
-    if [[ "$_first_path" == "$CONDA_PREFIX/bin" ]]; then
-      : # OK - conda is first
-    elif [[ "$_first_path" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]] && \
-         [[ "$_second_path" == "$CONDA_PREFIX/bin" ]]; then
-      : # OK - pymanager wrapper first, conda second
-    else
-      _pymanager_needs_path_fix=1
-    fi
+    [[ "$_first_path" == "$CONDA_PREFIX/bin" ]] || _pymanager_needs_path_fix=1
   fi
 
   if (( _pymanager_needs_path_fix )); then
     export _PYMANAGER_PATH_INIT=1
-    
-    # First, check if there's already a pymanager wrapper directory in PATH (from setpy in parent shell)
-    # We need to preserve its position at the front
-    local _pymanager_existing_wrapper=""
-    local dir
-    for dir in $path; do
-      if [[ "$dir" =~ /pymanager[-.][A-Za-z0-9_]+/bin$ ]]; then
-        _pymanager_existing_wrapper="$dir"
-        break
-      fi
-    done
-    
+
     if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
       # Venv active - ensure venv's bin is first
       path=("$VIRTUAL_ENV/bin" ${path:#"$VIRTUAL_ENV/bin"})
@@ -152,21 +148,28 @@ typeset -g _PYMANAGER_LAST_WRAPPER_DIR
       fi
       unset _pymanager_init_bin
     fi
-    
+
     # ~/.local/bin always early (user scripts)
     if [[ -d "$HOME/.local/bin" ]]; then
       path=("$HOME/.local/bin" ${path:#"$HOME/.local/bin"})
     fi
-    
+
     # If there was an existing pymanager wrapper, put it back at the very front
-    # This preserves setpy's configuration when subshells are spawned
+    # (ahead of ~/.local/bin and venv/conda bin — the wrapper needs to win so
+    # bare `python3` resolves via wrapper, not Homebrew's python3).
     if [[ -n "$_pymanager_existing_wrapper" ]] && [[ -d "$_pymanager_existing_wrapper" ]]; then
       path=("$_pymanager_existing_wrapper" ${path:#"$_pymanager_existing_wrapper"})
     fi
-    unset _pymanager_existing_wrapper
-    
+
     export PATH="${(j/:/)path}"
+    # Bust zsh's command hash table so `python3` (etc.) gets re-resolved
+    # against the new PATH instead of pinning to whatever cache had (e.g.
+    # /opt/homebrew/bin/python3 from before the repair).
+    rehash 2>/dev/null || true
   fi
+
+  unset _pymanager_existing_wrapper _pymanager_existing_wrapper_idx _pm_dir _pm_i
+  unset _first_path _second_path _rest
 }
 
 # Candidate priority: higher wins when the same major.minor lives in several
@@ -1016,6 +1019,7 @@ setpy() {
                 if [[ -n "$_PYMANAGER_LAST_WRAPPER_DIR" ]]; then
                     path=(${path:#"$_PYMANAGER_LAST_WRAPPER_DIR/bin"})
                     export PATH="${(j/:/)path}"
+                    rehash 2>/dev/null || true
                     _pymanager_cleanup_wrapper_dir "$_PYMANAGER_LAST_WRAPPER_DIR"
                     _PYMANAGER_LAST_WRAPPER_DIR=""
                 fi
@@ -1218,6 +1222,9 @@ setpy() {
     export PATH="${(j/:/)path}"
     _PYMANAGER_LAST_WRAPPER_DIR="$wrapper_dir"
     _PYMANAGER_LAST_SET_BIN_DIR="$python_bin_dir"
+    # Bust the command-hash table so `python3` (etc.) resolves via the new
+    # wrapper dir instead of a cached pre-setpy path (e.g. Homebrew's python3).
+    rehash 2>/dev/null || true
 
     # Remove the previous wrapper dir now that PATH no longer references it.
     if [[ -n "$previous_wrapper_on_entry" ]] && [[ "$previous_wrapper_on_entry" != "$wrapper_dir" ]]; then
@@ -1896,6 +1903,18 @@ pyinfo() {
 # pywhich - Show actual binary paths for python/pip commands
 # Usage: pywhich python3.X [pip3.X ...]
 pywhich() {
+    # Guard against partial loads: if the helper functions aren't defined
+    # (sandboxed subshell, partial source), fall through to `command which`
+    # without emitting "command not found: _py_manager_available". Same pattern
+    # the python/pip wrappers use.
+    if ! typeset -f _py_manager_available >/dev/null 2>&1 || \
+       ! typeset -f _scan_all_pythons >/dev/null 2>&1; then
+        for cmd in "$@"; do
+            command which "$cmd" 2>/dev/null || echo "$cmd: not found"
+        done
+        return $?
+    fi
+
     if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
         _scan_all_pythons
         local example_ver="${_PYTHON_VERSIONS[-1]:-3.x}"
@@ -1919,7 +1938,7 @@ pywhich() {
     fi
 
     if ! _py_manager_available; then
-        # Fall back to command which if manager not fully loaded
+        # Fall back to command which if manager not fully initialized
         for cmd in "$@"; do
             command which "$cmd" 2>/dev/null || echo "$cmd: not found"
         done
@@ -2061,6 +2080,14 @@ pywhich() {
 # which - wrapper that uses pywhich for python/pip commands
 # Passes through to real which for everything else
 which() {
+    # Partial-load safety: if the scanner/helper functions aren't defined
+    # (sandboxed subshell, partial source), just pass through to real which.
+    if ! typeset -f _scan_all_pythons >/dev/null 2>&1 || \
+       ! typeset -f pywhich >/dev/null 2>&1; then
+        command which "$@"
+        return $?
+    fi
+
     # Help option
     if [[ "$1" == "--pyhelp" ]]; then
         _scan_all_pythons
