@@ -66,7 +66,7 @@ pip install requests          # Error: use a virtual environment (or build mode)
 setpy 3.14              # -> python / python3 now route to 3.14
 python --version        # -> Python 3.14.4
 setpy                   # show current status
-setpy clear             # back to strict (bare python blocked)
+setpy clear             # drop session override; falls back to the global pin if set, else strict
 ```
 
 Typo-friendly: `set 3.14`, `set py3.13`, `set clear` are auto-routed to the
@@ -117,6 +117,10 @@ Behavior notes:
 - **Manual session override wins.** If you run `setpy 3.13` then
   `setpy global 3.14`, the current shell keeps using 3.13; only new
   shells see 3.14. The pin file is always written regardless.
+- **`setpy clear` falls back to the pin.** In a pinned shell you can
+  `setpy 3.13` to temporarily switch, then `setpy clear` to return to
+  the pin (3.14) — not strict mode. Without a pin, `setpy clear` drops
+  to strict as before.
 - **Non-interactive shells.** The init auto-apply is gated on
   `[[ -o interactive ]]`. Scripts and non-interactive subshells inherit
   whatever PATH/PYTHON the parent interactive shell already exported.
@@ -228,7 +232,7 @@ When invoked as the `pyinstall` shell function (sourced via `pythonmanager.sh`),
 | `py3.X` | Alias for python3.X |
 | `setpy <version>` | Set temporary Python default (this shell) |
 | `setpy <version> --build` | Set default + allow pip |
-| `setpy clear` | Clear session override and build mode |
+| `setpy clear` | Clear session override and build mode. Falls back to the `setpy global` pin if one is set; else strict mode. |
 | `setpy` | Show current status |
 | `setpy global <version>` | Persistent pin — every new shell auto-applies it |
 | `setpy global clear` | Remove the persistent pin |

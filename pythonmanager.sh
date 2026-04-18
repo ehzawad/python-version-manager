@@ -968,7 +968,7 @@ setpy() {
                 _scan_all_pythons
                 local example_ver="${_PYTHON_VERSIONS[-1]:-3.x}"
                 echo "Usage: setpy <version> [--build]    Set temporary Python default (this shell only)"
-                echo "       setpy clear                  Clear the session override"
+                echo "       setpy clear                  Clear the session override (falls back to the global pin if set, else strict)"
                 echo "       setpy                        Show current status"
                 echo "       setpy global <version>       Pin a Python for every new shell (persisted)"
                 echo "       setpy global clear           Remove the persistent pin"
@@ -1063,6 +1063,34 @@ setpy() {
         else
             (( quiet )) || echo "No Python override or build mode is set."
         fi
+
+        # After clearing, fall back to the persistent global pin if one is
+        # set and points at an installed version. This makes `setpy clear`
+        # mean "return to the default for this user" rather than "drop to
+        # strict mode". Users without a pin keep the old behavior (strict)
+        # because the file simply doesn't exist.
+        if [[ $had_override -eq 1 ]]; then
+            local _clear_pin_file
+            _clear_pin_file=$(_pymanager_global_default_file)
+            if [[ -f "$_clear_pin_file" ]]; then
+                local _clear_pin_version
+                _clear_pin_version=$(head -n1 "$_clear_pin_file" 2>/dev/null | tr -d '[:space:]')
+                if [[ "$_clear_pin_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                    _scan_all_pythons
+                    if [[ -n "${_PYTHON_PATHS[$_clear_pin_version]}" ]]; then
+                        if setpy "$_clear_pin_version" --quiet 2>/dev/null; then
+                            _PYMANAGER_OVERRIDE_SOURCE="global"
+                            (( quiet )) || echo "Restored persistent global default: Python $_clear_pin_version."
+                        fi
+                    else
+                        (( quiet )) || print -u2 -- "[pymanager] persisted global Python ${_clear_pin_version} is not installed; staying strict."
+                    fi
+                else
+                    (( quiet )) || print -u2 -- "[pymanager] ${_clear_pin_file}: invalid content; staying strict."
+                fi
+            fi
+        fi
+
         return 0
     fi
 
