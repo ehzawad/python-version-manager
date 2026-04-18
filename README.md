@@ -6,10 +6,11 @@ A lightweight shell-based Python version manager that enforces explicit Python v
 
 - **Forces explicit Python versions** — bare `python` and `python3` are **blocked** in a fresh interactive shell. You must either run `setpy <version>` or call an explicit `python3.X`. This is the central invariant of the tool.
 - **Prefers your self-builds** — `~/opt/python/<ver>` beats Homebrew/apt at the same major.minor, even when the package manager ships a newer patch
-- **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, Cursor Agent, sandboxes) refuse too
+- **Blocks pip outside virtual environments** — enforced both by interactive wrappers and by `PIP_REQUIRE_VIRTUALENV=1` as the manager baseline, so subprocess `pip` calls (Codex CLI, Claude Code, Cursor Agent, sandboxes) refuse too. **This stays in force under every default mode below** — `setpy`, `setpy global`, and `PYMANAGER_AUTO_SETPY=1` never weaken pip safety.
 - **Build mode** — temporarily allow pip outside a venv for building modules, `setpy <version> --build`
 - **Typo guard** — `set 3.14`, `set py3.13`, `set clear` (all common `setpy` typos) auto-route to `setpy` with a one-line hint
-- **Opt-in ergonomic mode** — `export PYMANAGER_AUTO_SETPY=1` (before sourcing) makes every new interactive shell auto-`setpy latest`, so agents see the self-build on PATH without running `setpy` each time
+- **Persistent global default (opt-out from strict)** — `setpy global <ver>` pins a Python in `~/.config/pymanager/default-version`; every new shell applies it automatically. `setpy global clear` removes the pin. Precedence: manual in-shell `setpy` > persisted pin > `PYMANAGER_AUTO_SETPY=1` > strict mode.
+- **Opt-in drifting-latest** — `export PYMANAGER_AUTO_SETPY=1` (before sourcing) makes every new interactive shell auto-`setpy latest`. Only fires when no persisted pin exists.
 - **AI-tool compatibility** — when `setpy` is active, a session wrapper directory on PATH routes subprocess `python`/`pip` calls to the chosen interpreter; cleaned up automatically on shell exit via `zshexit`
 - **Virtual environment detection** — venv, conda, poetry, pipenv
 - **Source-build automation** — `pyinstall status / install / upgrade` diffs your local CPython builds against python.org, handles Sigstore (3.14+) or OpenPGP (≤3.13) verification fail-closed, and runs a PGO+LTO `make altinstall` build
@@ -72,7 +73,55 @@ Typo-friendly: `set 3.14`, `set py3.13`, `set clear` are auto-routed to the
 right `setpy` command (with a one-line hint), since `set` is a zsh builtin
 you almost never actually want when you're thinking about Python versions.
 
-### Opt-in ergonomic mode (auto-setpy)
+### Set a persistent global default
+
+`setpy` is session-scoped by design. If you want a pinned Python that
+survives new terminal windows (without editing `~/.zshrc`), use
+`setpy global`:
+
+```bash
+setpy global 3.14              # Pin 3.14 — every new shell auto-applies it
+setpy global                   # Show the current pin
+setpy global clear             # Remove the pin; new shells go back to strict
+```
+
+The pin lives in `${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version`
+as a single line containing a selector like `3.14` (major.minor). Storing
+the selector rather than a resolved path means `pyinstall upgrade 3.14`
+transparently moves the pin from `3.14.3` to `3.14.4` — no file edits
+needed.
+
+Precedence on each new shell (highest wins):
+
+1. Manual `setpy <version>` you run in that shell
+2. Persisted pin (this command)
+3. `PYMANAGER_AUTO_SETPY=1` (drifting-latest below) — only fires when no pin exists
+4. Strict mode — bare `python`/`python3` blocked
+
+What `setpy global` does **not** do: it does not weaken the pip-outside-venv
+block. `PIP_REQUIRE_VIRTUALENV=1` stays in force, wrappers still refuse,
+subprocesses still refuse. The pin only changes which interpreter `python`
+and `python3` route to — nothing else.
+
+Behavior notes:
+
+- **Missing pin target.** If the pinned version was uninstalled between
+  sessions, new shells print `[pymanager] persisted global Python X.Y is
+  not installed.` and fall back to strict mode (they do *not* silently
+  pick latest — that would violate your explicit pin). Run
+  `setpy global clear` or `setpy global <installed-version>` to recover.
+- **Invalid pin file.** Same treatment: warn once, stay strict.
+- **Already-open shells.** The pin only affects *new* shells. Open tmux
+  panes, existing terminals, and ssh sessions that don't re-source
+  `pythonmanager.sh` won't update until they do.
+- **Manual session override wins.** If you run `setpy 3.13` then
+  `setpy global 3.14`, the current shell keeps using 3.13; only new
+  shells see 3.14. The pin file is always written regardless.
+- **Non-interactive shells.** The init auto-apply is gated on
+  `[[ -o interactive ]]`. Scripts and non-interactive subshells inherit
+  whatever PATH/PYTHON the parent interactive shell already exported.
+
+### Opt-in drifting-latest (auto-setpy)
 
 If you'd rather have the latest detected Python picked automatically in every
 new interactive shell — useful when agent tools (Cursor, Claude Code, Codex
@@ -85,8 +134,12 @@ export PYMANAGER_AUTO_SETPY=1
 source ~/.config/zsh/pythonmanager.sh
 ```
 
-The default is off — you need to deliberately opt in. Without the flag,
-bare `python`/`python3` stay blocked until you explicitly run `setpy`.
+The default is off — you need to deliberately opt in. Without the flag
+(and without a `setpy global` pin), bare `python`/`python3` stay blocked
+until you explicitly run `setpy`.
+
+If both `PYMANAGER_AUTO_SETPY=1` and a `setpy global` pin are set, the
+pin wins. Explicit version beats implicit latest.
 
 ### Build Mode (Allow pip)
 
@@ -173,10 +226,13 @@ When invoked as the `pyinstall` shell function (sourced via `pythonmanager.sh`),
 |---------|-------------|
 | `python3.X` | Run specific Python version (always works) |
 | `py3.X` | Alias for python3.X |
-| `setpy <version>` | Set temporary Python default |
+| `setpy <version>` | Set temporary Python default (this shell) |
 | `setpy <version> --build` | Set default + allow pip |
-| `setpy clear` | Clear override and build mode |
+| `setpy clear` | Clear session override and build mode |
 | `setpy` | Show current status |
+| `setpy global <version>` | Persistent pin — every new shell auto-applies it |
+| `setpy global clear` | Remove the persistent pin |
+| `setpy global` | Show the current persistent pin |
 | `pyinfo` | Show selected Python per major.minor |
 | `pyinfo --all` | Also show shadowed candidates |
 | `pyrefresh` | Re-scan for newly installed Pythons |
@@ -190,6 +246,16 @@ When invoked as the `pyinstall` shell function (sourced via `pythonmanager.sh`),
 | `pyinstall deps` | Print OS-specific dep install command (does not run it) |
 
 ## How It Works
+
+### Shell init order
+On each interactive shell init, the manager picks a default Python using this precedence (highest wins):
+
+1. **Session override** — whatever `setpy <version>` the user runs in the shell after init. Takes precedence over everything below for that shell.
+2. **Persistent pin** — if `~/.config/pymanager/default-version` exists and contains a valid, installed selector, the manager auto-`setpy`s it (source = `global`). If the file exists but is invalid or names an uninstalled version, the manager warns and stays strict — it does *not* fall through to AUTO_SETPY, because that would silently violate the user's explicit pin.
+3. **AUTO_SETPY** — `PYMANAGER_AUTO_SETPY=1` sets the newest installed Python as session default (source = `auto`). Only fires when no pin file exists.
+4. **Strict mode** — bare `python`/`python3` stay blocked until the user runs `setpy` explicitly.
+
+Track the active source via `_PYMANAGER_OVERRIDE_SOURCE` (shown in `pydiag`).
 
 ### Interactive Shells
 Shell wrapper functions intercept `python`, `pip`, etc. and route them appropriately.
@@ -213,8 +279,11 @@ When a venv is active, `$VIRTUAL_ENV/bin` is kept ahead of the wrapper directory
 # Either use explicit version (run pyinfo to see available)
 python3.X --version
 
-# Or set a default
+# Or set a session default
 setpy <version>
+
+# Or pin a persistent global default (survives new shells)
+setpy global <version>
 ```
 
 ### "pip is not available outside virtual environments"
@@ -323,13 +392,22 @@ self-build is behind upstream, and `pyinfo --all` to see all candidates.
 | Variable | Description |
 |----------|-------------|
 | `PYTHON_MANAGER_FORCE_BYPASS=1` | Disable all wrapper logic (falls through to system commands) |
-| `PYMANAGER_AUTO_SETPY=1` | Opt-in: auto-`setpy latest` at each interactive shell init (default: off) |
+| `PYMANAGER_AUTO_SETPY=1` | Opt-in: auto-`setpy latest` at each interactive shell init. Only fires when no `setpy global` pin exists. (default: off) |
 | `PYMANAGER_NO_AUTO_SETPY=1` | Legacy back-compat no-op (auto-setpy is off by default now) |
+| `XDG_CONFIG_HOME` | Honored for pin-file location (`$XDG_CONFIG_HOME/pymanager/default-version`; defaults to `~/.config/pymanager/default-version`) |
 | `PYTHON` | Exported by setpy for subprocess compatibility |
 | `PYTHON3` | Exported by setpy for subprocess compatibility |
-| `PIP_REQUIRE_VIRTUALENV=1` | Set by the manager as a baseline; pip refuses installs outside venvs |
+| `PIP_REQUIRE_VIRTUALENV=1` | Set by the manager as a baseline; pip refuses installs outside venvs. Unchanged by `setpy global` — persistent default only sets python/python3, never weakens pip safety. |
 | `PYMANAGER_BUILD_MODE=1` | Set by `setpy --build`; flips `PIP_REQUIRE_VIRTUALENV` to 0 |
 | `PYMANAGER_DEBUG=1` | Enables scanner/debug output on stderr |
+
+## Files
+
+| Path | Purpose |
+|------|---------|
+| `${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version` | Persistent global pin written by `setpy global <ver>`. One line, selector format (e.g. `3.14`). Mode 0600. Removed by `setpy global clear`. |
+| `~/.cache/pymanager/` | `pyinstall` caches: downloads, build tree, managed GPG keyring, Sigstore metadata cache, Sigstore venv. |
+| `${TMPDIR:-/tmp}/pymanager.XXXXXXXX/` | Per-shell session wrapper directory; cleaned up on shell exit. |
 
 ## Uninstall
 
@@ -341,6 +419,10 @@ rm ~/.config/zsh/pythonmanager.sh ~/.config/zsh/pyinstall.sh
 # Wrapper directories clean themselves up on shell exit. Any leftovers
 # from a crashed shell can be removed safely with:
 rm -rf "${TMPDIR:-/tmp}"pymanager.* 2>/dev/null || true
+
+# Persistent global pin (if you set one):
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version"
+rmdir "${XDG_CONFIG_HOME:-$HOME/.config}/pymanager" 2>/dev/null || true
 
 # pyinstall caches (downloads, build tree, managed GPG/Sigstore keyrings):
 rm -rf ~/.cache/pymanager

@@ -73,6 +73,11 @@ typeset -g _PYTHON_OVERRIDE
 typeset -gi _PYTHON_BUILD_MODE
 typeset -g _PYMANAGER_LAST_SET_BIN_DIR
 typeset -g _PYMANAGER_LAST_WRAPPER_DIR
+# Where the current override came from: "session" (manual setpy), "global"
+# (persisted pin in ~/.config/pymanager/default-version), "auto" (PYMANAGER_AUTO_SETPY=1),
+# or empty (no override). Used by `setpy global clear` to decide whether
+# tearing down the shell's wrapper is safe, and by pydiag for visibility.
+typeset -g _PYMANAGER_OVERRIDE_SOURCE
 
 # === EARLY PATH SETUP (runs on source, before functions are defined) ===
 # Runs on every source. Ensures login shells get correct PATH ordering even
@@ -941,6 +946,15 @@ setpy() {
         return 1
     fi
 
+    # Persistent global default subcommand: setpy global [<ver>|clear]
+    # Delegated before normal arg parsing so `global` is a keyword, not a
+    # version that could confuse the scanner.
+    if [[ "${1:-}" == "global" ]]; then
+        shift
+        _setpy_global "$@"
+        return $?
+    fi
+
     local version=""
     local build_mode=0
     local quiet=0
@@ -953,9 +967,12 @@ setpy() {
             -h|--help)
                 _scan_all_pythons
                 local example_ver="${_PYTHON_VERSIONS[-1]:-3.x}"
-                echo "Usage: setpy <version> [--build]    Set temporary Python default"
-                echo "       setpy clear                  Clear the override"
+                echo "Usage: setpy <version> [--build]    Set temporary Python default (this shell only)"
+                echo "       setpy clear                  Clear the session override"
                 echo "       setpy                        Show current status"
+                echo "       setpy global <version>       Pin a Python for every new shell (persisted)"
+                echo "       setpy global clear           Remove the persistent pin"
+                echo "       setpy global                 Show the current pin"
                 echo ""
                 echo "Options:"
                 echo "   --build    Also allow pip outside venv (for building modules)"
@@ -1017,6 +1034,7 @@ setpy() {
             if [[ $had_override -eq 1 ]]; then
                 (( quiet )) || echo "Cleared Python override (was ${_PYTHON_OVERRIDE})."
                 _PYTHON_OVERRIDE=""
+                _PYMANAGER_OVERRIDE_SOURCE=""
                 unset PYTHON PYTHON3
                 _PYMANAGER_LAST_SET_BIN_DIR=""
 
@@ -1151,8 +1169,11 @@ setpy() {
         return 1
     fi
 
-    # Set shell override
+    # Set shell override. Default source is "session" (manual setpy); the
+    # init blocks that call setpy --quiet at source time overwrite this to
+    # "global" or "auto" after the call returns.
     _PYTHON_OVERRIDE="$version"
+    _PYMANAGER_OVERRIDE_SOURCE="session"
 
     # Get the bin directory for this Python
     local python_bin_dir="${python_target%/*}"
@@ -1277,6 +1298,195 @@ setpy() {
             echo "Warning: You're in a virtual environment, which takes precedence."
         fi
     fi
+}
+
+# Resolve the persistence file path for the global default pin. Honors
+# $XDG_CONFIG_HOME if set (falls back to ~/.config on macOS). Kept as a
+# function so the location is computed consistently everywhere — shell init,
+# `setpy global`, and pydiag all agree.
+_pymanager_global_default_file() {
+    printf '%s/pymanager/default-version\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# setpy global [<version>|clear] — persist (or remove) a Python pin that
+# every new interactive shell will auto-apply. Called from setpy() when the
+# first positional arg is literally "global".
+#
+# Design notes:
+#  - Stores the selector (e.g. "3.14"), not a resolved path, so pyinstall
+#    upgrade 3.14 moves the pin from 3.14.3 to 3.14.4 without rewriting.
+#  - Writes atomically (tmp + mv) with umask 077 so the file is 0600.
+#  - Rejects `latest`/`auto` as selectors — if the user wants drifting-latest
+#    they should use PYMANAGER_AUTO_SETPY=1 instead. Explicit pin means pin.
+#  - Rejects --build — build mode is intentionally ephemeral.
+#  - Also applies the new pin to the current shell, unless the current
+#    override came from a manual setpy (source=session). A manual override
+#    in the current shell is a conscious choice and shouldn't be clobbered.
+_setpy_global() {
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/pymanager"
+    local default_file
+    default_file=$(_pymanager_global_default_file)
+
+    if [[ $# -eq 0 ]]; then
+        # Show status
+        if [[ -f "$default_file" ]]; then
+            local v
+            v=$(head -n1 "$default_file" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "Persistent global default: Python $v"
+                echo "   File: $default_file"
+                _scan_all_pythons
+                if [[ -n "${_PYTHON_PATHS[$v]}" ]]; then
+                    echo "   Binary: ${_PYTHON_PATHS[$v]}"
+                else
+                    echo "   Status: NOT INSTALLED — new shells will warn and stay strict"
+                fi
+            else
+                echo "Persistent global default file is invalid: $default_file" >&2
+                echo "   Expected content: <major>.<minor> (e.g. 3.14)" >&2
+                echo "   Got: '$v'" >&2
+                return 1
+            fi
+        else
+            echo "No persistent global default is set."
+            echo ""
+            echo "Usage: setpy global <version>    Pin a Python for every new shell"
+            echo "       setpy global clear        Remove the pin"
+        fi
+        return 0
+    fi
+
+    local sub="$1"
+    shift
+
+    case "$sub" in
+        -h|--help)
+            echo "Usage: setpy global <version>    Pin a Python for every new shell"
+            echo "       setpy global clear        Remove the pin"
+            echo "       setpy global              Show the current pin"
+            echo ""
+            echo "Pin is stored as a selector (e.g. '3.14') in:"
+            echo "   ${default_file}"
+            echo ""
+            echo "Precedence (highest wins):"
+            echo "   1. Manual 'setpy <ver>' in this shell"
+            echo "   2. Persisted global pin (this command)"
+            echo "   3. PYMANAGER_AUTO_SETPY=1 auto-latest"
+            echo "   4. Strict mode (bare python/python3 blocked)"
+            echo ""
+            echo "Note: pip outside a venv stays blocked. This only sets the"
+            echo "      python/python3 default — it does NOT weaken pip safety."
+            return 0
+            ;;
+        clear|unset|reset)
+            local had_file=0
+            local old=""
+            if [[ -f "$default_file" ]]; then
+                had_file=1
+                old=$(head -n1 "$default_file" 2>/dev/null | tr -d '[:space:]')
+                if ! rm -f "$default_file" 2>/dev/null; then
+                    echo "Error: failed to remove $default_file" >&2
+                    return 1
+                fi
+            fi
+
+            if (( had_file )); then
+                echo "Cleared persistent global default (was Python ${old:-unknown})."
+            else
+                echo "No persistent global default was set."
+            fi
+
+            # Only tear down the current shell's wrapper if it came FROM the
+            # global pin. A manual session setpy in this shell is the user's
+            # explicit choice and must not be destroyed as a side effect.
+            if [[ "${_PYMANAGER_OVERRIDE_SOURCE:-}" == "global" ]] && [[ -n "$_PYTHON_OVERRIDE" ]]; then
+                echo "Clearing current shell override (was sourced from global pin)."
+                setpy clear --quiet
+            fi
+            return 0
+            ;;
+        *)
+            local version="$sub"
+
+            # Reject --build — build mode is intentionally ephemeral.
+            local arg
+            for arg in "$@"; do
+                if [[ "$arg" == "--build" ]]; then
+                    echo "Error: --build cannot be persisted globally." >&2
+                    echo "Build mode is ephemeral by design. Use 'setpy <ver> --build'" >&2
+                    echo "for the current shell only." >&2
+                    return 2
+                fi
+            done
+
+            # Strip python/py prefix so 'setpy global python3.14' also works.
+            if [[ "$version" =~ ^python([0-9]+\.[0-9]+)$ ]]; then
+                version="${match[1]}"
+            elif [[ "$version" =~ ^py([0-9]+\.[0-9]+)$ ]]; then
+                version="${match[1]}"
+            fi
+
+            # Accept only literal <major>.<minor>. 'latest'/'auto' are
+            # rejected — persistent pin means persistent version.
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "Error: '$sub' is not a valid pin. Use <major>.<minor> (e.g. 3.14)." >&2
+                echo "       'latest' and 'auto' are not accepted for the persistent pin." >&2
+                echo "       For drifting-latest, use: export PYMANAGER_AUTO_SETPY=1" >&2
+                return 2
+            fi
+
+            # Validate the version is actually installed before persisting —
+            # no point writing a file that would immediately warn on next shell.
+            _PYTHONS_SCANNED=0
+            _scan_all_pythons
+            if [[ -z "${_PYTHON_PATHS[$version]}" ]]; then
+                echo "Error: Python ${version} not found on this system" >&2
+                echo "" >&2
+                echo "Available versions:" >&2
+                local ver
+                for ver in $_PYTHON_VERSIONS; do
+                    echo "  - ${ver}" >&2
+                done
+                return 1
+            fi
+
+            # Atomic write: mkdir -p, umask 077, tmp + mv.
+            if ! mkdir -p "$config_dir" 2>/dev/null; then
+                echo "Error: cannot create $config_dir" >&2
+                return 1
+            fi
+            local tmp="${default_file}.tmp.$$"
+            if ! (umask 077 && print -r -- "$version" > "$tmp") 2>/dev/null; then
+                echo "Error: failed to write $tmp" >&2
+                rm -f "$tmp" 2>/dev/null
+                return 1
+            fi
+            if ! mv "$tmp" "$default_file" 2>/dev/null; then
+                echo "Error: failed to rename $tmp → $default_file" >&2
+                rm -f "$tmp" 2>/dev/null
+                return 1
+            fi
+
+            echo "Set persistent global default: Python $version"
+            echo "   File: $default_file"
+            echo "   New shells will auto-apply this pin."
+
+            # Apply to the current shell unless a manual session setpy is
+            # already active. A user who ran 'setpy 3.13' then 'setpy global 3.14'
+            # is probably staging a rollout; don't yank the rug from under them.
+            if [[ "${_PYMANAGER_OVERRIDE_SOURCE:-}" == "session" ]] && [[ -n "$_PYTHON_OVERRIDE" ]]; then
+                echo ""
+                echo "Note: this shell has a manual session override (${_PYTHON_OVERRIDE}); not changing it."
+                echo "      Run 'setpy clear' to adopt the global pin in this shell."
+            else
+                echo ""
+                if setpy "$version" --quiet; then
+                    _PYMANAGER_OVERRIDE_SOURCE="global"
+                fi
+            fi
+            return 0
+            ;;
+    esac
 }
 
 # Validate that the override Python still exists
@@ -1639,7 +1849,34 @@ pydiag() {
     echo "  _PYTHON_MANAGER_READY=${_PYTHON_MANAGER_READY:-0}"
     echo "  _PYTHONS_SCANNED=${_PYTHONS_SCANNED:-0}"
     echo "  _PYTHON_OVERRIDE=${_PYTHON_OVERRIDE:-<not set>}"
+    echo "  _PYMANAGER_OVERRIDE_SOURCE=${_PYMANAGER_OVERRIDE_SOURCE:-<not set>}   (session|global|auto)"
     echo "  _PYTHON_BUILD_MODE=${_PYTHON_BUILD_MODE:-0}"
+    echo ""
+
+    local _pydiag_global_file
+    _pydiag_global_file=$(_pymanager_global_default_file 2>/dev/null)
+    echo "Persistent Global Default:"
+    echo "  File: ${_pydiag_global_file}"
+    if [[ -f "$_pydiag_global_file" ]]; then
+        local _pydiag_pin
+        _pydiag_pin=$(head -n1 "$_pydiag_global_file" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$_pydiag_pin" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "  Pinned version: ${_pydiag_pin}"
+            if typeset -f _scan_all_pythons >/dev/null 2>&1; then
+                _scan_all_pythons 2>/dev/null
+                if [[ -n "${_PYTHON_PATHS[$_pydiag_pin]}" ]]; then
+                    echo "  Pinned status: installed (${_PYTHON_PATHS[$_pydiag_pin]})"
+                else
+                    echo "  Pinned status: NOT INSTALLED — new shells warn and stay strict"
+                fi
+            fi
+        else
+            echo "  Pinned version: INVALID ('${_pydiag_pin}')"
+        fi
+    else
+        echo "  Pinned version: <none>"
+    fi
+    echo "  Auto-latest (PYMANAGER_AUTO_SETPY): ${PYMANAGER_AUTO_SETPY:-0}   (applies only when no pin file)"
     echo ""
 
     if typeset -f _py_manager_should_bypass >/dev/null 2>&1; then
@@ -2232,33 +2469,69 @@ fi
 # recorded owner PID. Safe to skip failures silently.
 _pymanager_cleanup_orphan_wrappers 2>/dev/null
 
-# === AUTO-SETPY (opt-in) ===
+# === SHELL DEFAULT PYTHON (persistent pin, then AUTO_SETPY fallback) ===
 #
-# Strict is the default: bare `python` and `python3` are BLOCKED in a fresh
-# interactive shell until you run `setpy <version>` or use explicit
-# `python3.X`. This matches the project's central "no default python"
-# invariant from the README.
+# Strict is still the headline default: bare `python` and `python3` are
+# BLOCKED in a fresh interactive shell until something sets an override.
+# Two things can set an override implicitly at shell init:
 #
-# Users who want the old ergonomic "just works" UX — agents see the
-# self-build via PATH in every fresh shell without running setpy — can
-# opt in by putting this BEFORE sourcing pythonmanager.sh in `.zshrc`:
+#   1. A persistent pin file at ${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version.
+#      Managed via `setpy global <ver>` / `setpy global clear`. Stores a
+#      selector like "3.14" (not a path), so `pyinstall upgrade 3.14` moves
+#      the pin to the latest patch transparently.
 #
-#   export PYMANAGER_AUTO_SETPY=1
+#   2. `export PYMANAGER_AUTO_SETPY=1` in .zshrc (before sourcing this file).
+#      Each new interactive shell runs `setpy latest --quiet`.
 #
-# When enabled, each new interactive shell picks the latest detected Python
-# as the session default. Scanner priority (user-built under ~/opt/python
-# beats Homebrew/apt/system) decides which concrete binary gets wrapped.
+# Precedence: pin > AUTO_SETPY. If the pin file exists but is invalid or
+# names an uninstalled version, warn and fall back to STRICT — do NOT
+# cascade to AUTO_SETPY. Silently picking "latest" under a broken pin would
+# violate the user's explicit contract.
 #
-# PYMANAGER_NO_AUTO_SETPY=1 is still honored as a no-op (back-compat with
-# .zshrc files that set it under the previous ergonomic default).
+# Manual `setpy <ver>` in the running shell takes precedence over both —
+# that's handled implicitly because setpy just overwrites _PYTHON_OVERRIDE
+# when the user types it.
+#
+# PYMANAGER_NO_AUTO_SETPY=1 remains honored as a back-compat no-op.
 if [[ -o interactive ]] && \
-   [[ "${PYMANAGER_AUTO_SETPY:-0}" == "1" ]] && \
-   [[ -z "${PYMANAGER_NO_AUTO_SETPY:-}" ]] && \
    ! _py_manager_should_bypass && \
    [[ -z "$_PYTHON_OVERRIDE" ]] && \
    ! _in_virtual_env; then
-    _scan_all_pythons
-    if (( ${#_PYTHON_VERSIONS} > 0 )); then
-        setpy latest --quiet 2>/dev/null || true
+    _pymanager_global_file="${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version"
+    _pymanager_init_handled=0
+
+    if [[ -f "$_pymanager_global_file" ]]; then
+        # Read and validate the pinned selector.
+        _pymanager_global_version=$(head -n1 "$_pymanager_global_file" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$_pymanager_global_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            _scan_all_pythons
+            if [[ -n "${_PYTHON_PATHS[$_pymanager_global_version]}" ]]; then
+                if setpy "$_pymanager_global_version" --quiet 2>/dev/null; then
+                    _PYMANAGER_OVERRIDE_SOURCE="global"
+                fi
+            else
+                print -u2 -- "[pymanager] persisted global Python ${_pymanager_global_version} is not installed."
+                print -u2 -- "[pymanager] strict mode active. Run: setpy global clear  or  setpy global <version>"
+            fi
+        else
+            print -u2 -- "[pymanager] ${_pymanager_global_file}: invalid content; expected <major>.<minor> (e.g. 3.14)"
+            print -u2 -- "[pymanager] strict mode active. Run: setpy global clear  or  setpy global <version>"
+        fi
+        # File existed (valid or not) — do not cascade to AUTO_SETPY.
+        _pymanager_init_handled=1
     fi
+
+    # AUTO_SETPY only fires when there's no pin file at all.
+    if (( ! _pymanager_init_handled )) && \
+       [[ "${PYMANAGER_AUTO_SETPY:-0}" == "1" ]] && \
+       [[ -z "${PYMANAGER_NO_AUTO_SETPY:-}" ]]; then
+        _scan_all_pythons
+        if (( ${#_PYTHON_VERSIONS} > 0 )); then
+            if setpy latest --quiet 2>/dev/null; then
+                _PYMANAGER_OVERRIDE_SOURCE="auto"
+            fi
+        fi
+    fi
+
+    unset _pymanager_global_file _pymanager_global_version _pymanager_init_handled
 fi
