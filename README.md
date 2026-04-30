@@ -432,7 +432,553 @@ rmdir "${XDG_CONFIG_HOME:-$HOME/.config}/pymanager" 2>/dev/null || true
 rm -rf ~/.cache/pymanager
 ```
 
-## License
+### usage
 
-MIT - Created by ehzawad@gmail.com
+## What this repo is doing
+
+I read the repo’s main docs and shell scripts: [README.md](https://github.com/ehzawad/python-version-manager/blob/main/README.md), [pythonmanager.sh](https://github.com/ehzawad/python-version-manager/blob/main/pythonmanager.sh), [pyinstall.sh](https://github.com/ehzawad/python-version-manager/blob/main/pyinstall.sh), and [python-installation-process.md](https://github.com/ehzawad/python-version-manager/blob/main/python-installation-process.md).
+
+The mental model is:
+
+This is a zsh-based Python version manager. In a fresh interactive shell, bare `python` and `python3` are intentionally blocked until you select a version with `setpy`, unless you configure a persistent global default. It also blocks `pip` outside virtual environments by default using wrappers plus `PIP_REQUIRE_VIRTUALENV=1`.
+
+It separates two concerns:
+
+1. `pythonmanager.sh` manages shell-time Python selection: `setpy`, `pyinfo`, `pywhich`, `pyrefresh`, `pydiag`.
+2. `pyinstall.sh` manages CPython source builds and upgrades under `~/opt/python/<version>`: `pyinstall status`, `install`, `upgrade`, `latest`, `verify`, `deps`.
+
+## One-time installation
+
+From the repo directory:
+
+```zsh
+mkdir -p ~/.config/zsh ~/.local/bin
+```
+
+```zsh
+cp pythonmanager.sh pyinstall.sh ~/.config/zsh/
+```
+
+```zsh
+chmod +x ~/.config/zsh/pyinstall.sh
+```
+
+Add this to `~/.zshrc`:
+
+```zsh
+export PATH="$HOME/.local/bin:$PATH"
+source ~/.config/zsh/pythonmanager.sh
+```
+
+Reload:
+
+```zsh
+source ~/.zshrc
+```
+
+Verify:
+
+```zsh
+pydiag
+```
+
+```zsh
+pyinfo
+```
+
+## Most important Python version selection commands
+
+### Show detected Python versions
+
+```zsh
+pyinfo
+```
+
+Shows the selected Python per major/minor version.
+
+```zsh
+pyinfo --all
+```
+
+Also shows shadowed candidates. This matters because the scanner prefers your self-built Python under `~/opt/python/<version>/bin` over Homebrew or system Python for the same major/minor series.
+
+### Run an explicit Python version without setting a default
+
+```zsh
+python3.14 --version
+```
+
+```zsh
+python3.13 -c "import sys; print(sys.executable)"
+```
+
+```zsh
+py3.12 script.py
+```
+
+This is the safest direct mode. It bypasses the need for a session default.
+
+### Set a temporary Python default for the current shell
+
+```zsh
+setpy 3.14
+```
+
+After that:
+
+```zsh
+python --version
+```
+
+```zsh
+python3 --version
+```
+
+Both route to the selected `3.14` interpreter.
+
+Check current status:
+
+```zsh
+setpy
+```
+
+Clear the session override:
+
+```zsh
+setpy clear
+```
+
+Important behavior: if you have a persistent global pin, `setpy clear` falls back to that pin. If no global pin exists, it returns to strict mode where bare `python` and `python3` are blocked.
+
+### Set a persistent global Python default
+
+```zsh
+setpy global 3.14
+```
+
+This writes a pin to:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/pymanager/default-version
+```
+
+Every new interactive shell auto-applies that pin.
+
+Show the current global pin:
+
+```zsh
+setpy global
+```
+
+Remove the global pin:
+
+```zsh
+setpy global clear
+```
+
+The key design detail: the pin stores a selector like `3.14`, not a full path. So after upgrading from `3.14.3` to `3.14.4`, the same `setpy global 3.14` pin should resolve to the newer patch automatically after refresh.
+
+### Auto-select latest installed Python in every shell
+
+Put this before sourcing `pythonmanager.sh` in `~/.zshrc`:
+
+```zsh
+export PYMANAGER_AUTO_SETPY=1
+source ~/.config/zsh/pythonmanager.sh
+```
+
+Use this only if you want “drifting latest” behavior. A persistent global pin wins over `PYMANAGER_AUTO_SETPY=1`.
+
+Priority is:
+
+1. Manual `setpy <version>` in the current shell
+2. `setpy global <version>` persistent pin
+3. `PYMANAGER_AUTO_SETPY=1`
+4. Strict mode
+
+## Important update and install commands
+
+### Check installed self-builds versus upstream latest
+
+```zsh
+pyinstall status
+```
+
+This is the first command I would run before upgrading. It compares your local CPython builds under `~/opt/python/<version>` against python.org’s latest supported patch releases.
+
+### Show latest upstream patch versions
+
+```zsh
+pyinstall latest
+```
+
+For one minor series:
+
+```zsh
+pyinstall latest 3.14
+```
+
+### Print dependency install command
+
+```zsh
+pyinstall deps
+```
+
+This prints the OS-specific dependency command. It does not install the dependencies by itself.
+
+On macOS, the expected dependency family is Homebrew-based. On Linux, the script emits apt-oriented build dependencies.
+
+### Install a specific CPython patch version
+
+```zsh
+pyinstall install 3.14.4
+```
+
+Safer dry run first:
+
+```zsh
+pyinstall install 3.14.4 --dry-run
+```
+
+Skip confirmation:
+
+```zsh
+pyinstall install 3.14.4 --yes
+```
+
+Use explicit parallelism:
+
+```zsh
+pyinstall install 3.14.4 --jobs 10
+```
+
+Install under a custom prefix:
+
+```zsh
+pyinstall install 3.14.4 --prefix "$HOME/opt/python/3.14.4"
+```
+
+### Upgrade a minor series to latest patch
+
+```zsh
+pyinstall upgrade 3.14
+```
+
+Safer dry run:
+
+```zsh
+pyinstall upgrade 3.14 --dry-run
+```
+
+Skip confirmation:
+
+```zsh
+pyinstall upgrade 3.14 --yes
+```
+
+Force rebuild over an existing prefix:
+
+```zsh
+pyinstall upgrade 3.14 --force
+```
+
+Important: `--force` moves the old prefix aside to an `.old-<timestamp>` directory under `~/opt/python`. The scanner deliberately demotes those old backup directories so they do not win version selection.
+
+### Verify a downloaded tarball
+
+```zsh
+pyinstall verify Python-3.14.4.tgz
+```
+
+The script uses Sigstore for Python `3.14+` and OpenPGP for `3.13` and older, according to the repo docs and `pyinstall.sh`.
+
+### Refresh shell detection after manual install
+
+```zsh
+pyrefresh
+```
+
+If you invoke `pyinstall` through the shell function from `pythonmanager.sh`, successful install/upgrade should auto-run `pyrefresh`. If you run `./pyinstall.sh` directly, run `pyrefresh` yourself afterward.
+
+## Pip and virtual environment commands
+
+### Recommended workflow
+
+Pick a Python version explicitly:
+
+```zsh
+python3.14 -m venv .venv
+```
+
+Activate it:
+
+```zsh
+source .venv/bin/activate
+```
+
+Install packages:
+
+```zsh
+pip install requests
+```
+
+Confirm:
+
+```zsh
+python -c "import sys; print(sys.executable)"
+```
+
+Deactivate:
+
+```zsh
+deactivate
+```
+
+### Temporary build mode
+
+Outside a virtual environment, `pip` is blocked by design. For package build workflows only:
+
+```zsh
+setpy 3.14 --build
+```
+
+Then:
+
+```zsh
+pip install build
+```
+
+```zsh
+python -m build
+```
+
+Clean up:
+
+```zsh
+setpy clear
+```
+
+Do not use build mode as your normal package-install workflow. Use a venv.
+
+## Diagnostic commands
+
+### Show actual binary resolution
+
+```zsh
+pywhich python3.14
+```
+
+```zsh
+pywhich python
+```
+
+```zsh
+pywhich pip
+```
+
+The repo also wraps `which` for Python/pip-related commands, but `pywhich` is the clearer command.
+
+### Full diagnostics
+
+```zsh
+pydiag
+```
+
+Useful when Cursor Agent, Claude Code, Codex CLI, or another subprocess sees a different `python3` than your terminal.
+
+### Debug scanner behavior
+
+```zsh
+PYMANAGER_DEBUG=1 pyinfo --all
+```
+
+### Inspect PATH ordering manually
+
+```zsh
+print -rl -- ${(ps.:.)PATH} | nl -ba | head -20
+```
+
+```zsh
+whence -p python
+```
+
+```zsh
+whence -p python3
+```
+
+## Practical command recipes
+
+### Set Python `3.14` for this terminal only
+
+```zsh
+setpy 3.14
+```
+
+```zsh
+python --version
+```
+
+```zsh
+python3 --version
+```
+
+### Make Python `3.14` the default for all new shells
+
+```zsh
+setpy global 3.14
+```
+
+Open a new terminal, then:
+
+```zsh
+python --version
+```
+
+### Upgrade Python `3.14` to latest patch and keep global pin working
+
+```zsh
+pyinstall status
+```
+
+```zsh
+pyinstall upgrade 3.14 --dry-run
+```
+
+```zsh
+pyinstall upgrade 3.14 --yes
+```
+
+```zsh
+pyrefresh
+```
+
+```zsh
+setpy global 3.14
+```
+
+The last command is usually only needed if you have not already pinned `3.14`.
+
+### Install exact version, then use it immediately
+
+```zsh
+pyinstall install 3.14.4 --dry-run
+```
+
+```zsh
+pyinstall install 3.14.4 --yes
+```
+
+```zsh
+pyrefresh
+```
+
+```zsh
+setpy 3.14
+```
+
+```zsh
+python --version
+```
+
+### Return to strict mode
+
+```zsh
+setpy clear
+```
+
+If a global pin exists and you want true strict mode:
+
+```zsh
+setpy global clear
+```
+
+```zsh
+setpy clear
+```
+
+### Let every new shell pick latest installed Python
+
+Add before sourcing the manager:
+
+```zsh
+export PYMANAGER_AUTO_SETPY=1
+source ~/.config/zsh/pythonmanager.sh
+```
+
+Then reload:
+
+```zsh
+source ~/.zshrc
+```
+
+## Commands I would personally memorize
+
+```zsh
+pyinfo
+```
+
+```zsh
+pyinfo --all
+```
+
+```zsh
+setpy 3.14
+```
+
+```zsh
+setpy clear
+```
+
+```zsh
+setpy global 3.14
+```
+
+```zsh
+setpy global clear
+```
+
+```zsh
+pyinstall status
+```
+
+```zsh
+pyinstall latest 3.14
+```
+
+```zsh
+pyinstall upgrade 3.14 --dry-run
+```
+
+```zsh
+pyinstall upgrade 3.14 --yes
+```
+
+```zsh
+pyrefresh
+```
+
+```zsh
+pywhich python3.14
+```
+
+```zsh
+pydiag
+```
+
+## Main caveat
+
+This repo is strict by design. If `python` or `python3` suddenly says no default command is available, that is not a bug. It means the manager is protecting you from accidentally using the wrong interpreter. Use one of these:
+
+```zsh
+python3.14 script.py
+```
+
+```zsh
+setpy 3.14
+```
+
+```zsh
+setpy global 3.14
+```
+
 
